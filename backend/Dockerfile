@@ -1,5 +1,5 @@
 # Multi-stage build. Same image for api / worker / migrate — behavior picked at
-# runtime via $ROLE (see docker-compose.yml). Update CMD once main.ts reads ROLE.
+# runtime via $ROLE (see docker-compose.yml).
 
 FROM node:20-alpine AS builder
 WORKDIR /app
@@ -14,6 +14,7 @@ ENV NODE_ENV=production
 COPY package*.json ./
 RUN npm ci --omit=dev
 COPY --from=builder /app/dist ./dist
+COPY data ./data
 USER node
 EXPOSE 3000
 CMD ["node", "dist/main.js"]

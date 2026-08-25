@@ -65,6 +65,8 @@ services:
     environment:
       ROLE: worker
       NODE_OPTIONS: ${NODE_OPTIONS}
+    ports:
+      - "${WORKER_PORT}:${WORKER_PORT}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -104,7 +106,9 @@ services:
       -c max_connections=60
       -c work_mem=4MB
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      # postgres:18+ images store data under /var/lib/postgresql directly
+      # (pg_ctlcluster-style layout) — mounting .../data breaks first boot.
+      - postgres-data:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
