@@ -1,0 +1,39 @@
+# Node
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+npm-debug.log*
+.pnpm-debug.log*
+
+# Env
+.env
+.env.local
+.env.*.local
+deploy/.env
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/*
+!.vscode/extensions.json
+.idea/
+
+# Docker
+deploy/postgres-data/
+deploy/redis-data/
+
+# Test / coverage
+coverage/
+.nyc_output/
+
+# k6
+loadtest/results/
+loadtest/*.json
+!loadtest/**/config.json

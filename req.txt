@@ -1,0 +1,23 @@
+Requirement
+
+flash sale system
+
+API
+- list all product
+วัดการทำ caching
+- order product
+รับ concurrent connection จำนวนมาก ห้ามให้มีการจองเกินจำนวน
+
+
+API Endpoint
+ต้องเขียน K6 Loadtest สำหรับตัวเอง และระหว่างกลุ่มได้
+1. API ขอ JWT token ไม่มีคะแนน แค่ให้รองรับการใช้งานของ 500 คนได้
+2. API ดึงข้อมูลสินค้า Read-Heavy ต้องมีการใช้ Redis caching เพื่อให้ Response เร็วสุด + pagination
+(วัด performances ตรงนี้) มี challenge คือต้องตอบตรงกับ scope ที่ต้องการ เช่น page=x&limit=x
+จุดที่น่าสนใจ
+Avaible stock เริ่ม flash sale มีกี่ชิ้น
+Remaining stock flash sale แล้วเหลือเท่าไหร่ มีชาเลนจ์ในการดู remaining stock ด้วย caching นับ count อย่างเดียวไม่ได้ รายงานต้องเขียนให้ชัด
+3. API สั่งซื้อสินค้า (Write-Heavy) 1 user จองได้แค่ 1 ชิ้นต่อproduct
+การจัดการ remaining stock ต้องใช้เทคนิค locking เท่านั้น
+
+Load test มีการลองเปลี่ยน page , limit บ้าง

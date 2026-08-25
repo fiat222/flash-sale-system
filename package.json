@@ -1,0 +1,14 @@
+{
+  "name": "flash-sale-system",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Repo-level tooling only (commit lint, husky). Backend app lives in backend/.",
+  "scripts": {
+    "prepare": "husky"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "^19.5.0",
+    "@commitlint/config-conventional": "^19.5.0",
+    "husky": "^9.1.6"
+  }
+}
