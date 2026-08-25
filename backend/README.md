@@ -12,10 +12,25 @@ NestJS + Fastify app. Full design rationale: [`../flash-sale-architecture.md`](.
 
 ## Local dev
 
+Either run directly on the host against local Postgres/Redis:
+
 ```bash
 npm install
 npm run start:dev
 ```
+
+Or run the whole stack in Docker with hot reload (no rebuild needed per edit):
+
+```bash
+cd ../deploy
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+```
+
+Edits under `backend/src` recompile and restart automatically. This uses
+polling-based file watching (`tsconfig.json`'s `watchOptions`) because Docker
+Desktop on Windows/Mac doesn't forward host filesystem events into the
+container's inotify across a bind mount — native watching silently never
+fires without it.
 
 ## Roles
 

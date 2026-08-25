@@ -17,5 +17,12 @@
     "strictBindCallApply": true,
     "forceConsistentCasingInFileNames": true,
     "noFallthroughCasesInSwitch": true
+  },
+  "watchOptions": {
+    // Docker Desktop on Windows/Mac doesn't forward host filesystem events
+    // into the container's inotify across a bind mount — native watching
+    // silently never fires. Polling is the only reliable option here.
+    "watchFile": "fixedPollingInterval",
+    "watchDirectory": "fixedPollingInterval"
   }
 }

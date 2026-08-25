@@ -1,0 +1,41 @@
+# Dev override — mounts backend/src so code changes hot-reload instead of
+# needing a full image rebuild. Use alongside the base file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+#
+# node_modules/dist stay inside the container (anonymous volumes) so the
+# Windows/Mac host filesystem never shadows the Linux-built native modules.
+
+x-dev-common: &dev-common
+  build:
+    target: development
+  # Only node_modules gets its own volume (native modules need to stay
+  # Linux-built) — dist can't be anonymous-volumed too: nest-cli's
+  # deleteOutDir tries to rmdir it on every watch restart, which fails with
+  # EBUSY against a mount point. Letting dist live under the bind mount is
+  # harmless (it's gitignored) and lets deleteOutDir do its job.
+  volumes:
+    - ../backend:/app
+    - /app/node_modules
+  command: npm run start:dev
+  environment:
+    # Base file caps V8 heap at 220MB for the compiled prod process — tsc's
+    # own watch-mode compilation needs more headroom than that to not OOM.
+    NODE_OPTIONS: ""
+  # ts compilation under --watch is heavier than the compiled prod process —
+  # the production budget from the architecture doc is too tight for it.
+  deploy:
+    resources:
+      limits:
+        cpus: "1.0"
+        memory: 1024M
+
+services:
+  api1:
+    <<: *dev-common
+  api2:
+    <<: *dev-common
+  api3:
+    <<: *dev-common
+  worker:
+    <<: *dev-common

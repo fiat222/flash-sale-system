@@ -34,7 +34,7 @@ describe('OrdersService', () => {
     expect(queue.add).toHaveBeenCalledWith(
       'deduct',
       { userId: 'user-1', productId: 'p-1001' },
-      expect.objectContaining({ jobId: 'user-1:p-1001', attempts: 3 }),
+      expect.objectContaining({ jobId: 'user-1|p-1001', attempts: 3 }),
     );
     expect(result).toEqual({
       status: 'processing',
