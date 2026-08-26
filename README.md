@@ -11,6 +11,12 @@ loadtest/   k6 scripts (read + write scenarios)
 deploy/     docker-compose.yml, nginx.conf, .env.example
 ```
 
+## Run For Develop
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+```
+
 ## Run
 
 ```bash
