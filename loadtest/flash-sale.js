@@ -199,14 +199,13 @@ function tallyOrder(res) {
 function sampleCache(phase) {
   const m = fetchMetrics();
   if (!m) return;
-  const l1 = m.metrics.cache_l1_hit || 0;
-  const l2 = m.metrics.cache_l2_hit || 0;
-  const miss = m.metrics.cache_miss || 0;
-  const total = l1 + l2 + miss;
+  const hit = m.metrics.cache_hit || 0; // Redis template hit
+  const miss = m.metrics.cache_miss || 0; // Postgres rebuild
+  const total = hit + miss;
   if (!total) return;
-  const hitPct = ((l1 + l2) / total) * 100;
+  const hitPct = (hit / total) * 100;
   readCacheHitPct.add(hitPct);
-  console.log(`[${phase}] cache hit ${hitPct.toFixed(2)}%  (L1 ${l1} / L2 ${l2} / miss ${miss})`);
+  console.log(`[${phase}] cache hit ${hitPct.toFixed(2)}%  (hit ${hit} / miss ${miss})`);
 }
 
 function fetchMetrics() {
@@ -240,19 +239,17 @@ export function teardown() {
   }
   const c = m.metrics || {};
   const q = m.queue || {};
-  const l1 = c.cache_l1_hit || 0;
-  const l2 = c.cache_l2_hit || 0;
+  const hit = c.cache_hit || 0;
   const miss = c.cache_miss || 0;
-  const tot = l1 + l2 + miss || 1;
+  const tot = hit + miss || 1;
   const pct = (n) => ((n / tot) * 100).toFixed(2);
 
   const lines = [
     '',
     '================  CACHE CHECK (GET /api/v1/_metrics)  ================',
-    `  L1 hit : ${l1}  (${pct(l1)}%)`,
-    `  L2 hit : ${l2}  (${pct(l2)}%)`,
-    `  miss   : ${miss}  (${pct(miss)}%)`,
-    `  HIT / MISS ratio : ${pct(l1 + l2)}%  /  ${pct(miss)}%`,
+    `  Redis hit             : ${hit}  (${pct(hit)}%)`,
+    `  miss (Postgres build) : ${miss}  (${pct(miss)}%)`,
+    `  HIT / MISS ratio      : ${pct(hit)}%  /  ${pct(miss)}%`,
     '',
     '================  QUEUE CHECK  ======================================',
     `  waiting=${q.waiting ?? '?'}  active=${q.active ?? '?'}  delayed=${q.delayed ?? '?'}`,

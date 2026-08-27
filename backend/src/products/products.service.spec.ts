@@ -49,9 +49,15 @@ describe('ProductsService', () => {
     expect(body.meta).toEqual({ total: 1, page: 1, limit: 10, totalPages: 1 });
   });
 
-  it('never touches Postgres again once the template is in L1', async () => {
+  it('never touches Postgres again once the template is cached in Redis', async () => {
     repo.findAndCount.mockResolvedValue([[], 0]);
     redis.mget.mockResolvedValue([]);
+    // First call: cache miss -> build + redis.set. Make the second redis.get
+    // return whatever was just stored (Redis-only Cache-Aside, no in-process cache).
+    redis.set.mockImplementation((_key: string, value: string) => {
+      redis.get.mockResolvedValue(value);
+      return Promise.resolve('OK');
+    });
 
     await service.getPage(2, 10);
     await service.getPage(2, 10);

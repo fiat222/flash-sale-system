@@ -98,17 +98,14 @@ export function teardown() {
     return;
   }
 
-  const l1 = m.cache_l1_hit || 0;
-  const l2 = m.cache_l2_hit || 0;
-  const miss = m.cache_miss || 0;
-  const hits = l1 + l2;
+  const hits = m.cache_hit || 0; // Redis template hit
+  const miss = m.cache_miss || 0; // Postgres rebuild
   const total = hits + miss;
   const pct = (n) => (total ? ((n / total) * 100).toFixed(2) : '0.00');
 
-  console.log('--- Cache Performance (GET /api/v1/_metrics) ---');
+  console.log('--- Cache Performance (GET /api/v1/_metrics) — Redis-only Cache-Aside ---');
   console.log(`lookups total : ${total}`);
-  console.log(`cache_l1_hit  : ${l1} (${pct(l1)}%)`);
-  console.log(`cache_l2_hit  : ${l2} (${pct(l2)}%)`);
-  console.log(`cache_miss    : ${miss} (${pct(miss)}%)`);
+  console.log(`cache_hit  (Redis)          : ${hits} (${pct(hits)}%)`);
+  console.log(`cache_miss (Postgres build) : ${miss} (${pct(miss)}%)`);
   console.log(`HIT / MISS    : ${pct(hits)}% hit  /  ${pct(miss)}% miss   (${hits} hit / ${miss} miss)`);
 }

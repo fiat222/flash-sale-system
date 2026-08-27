@@ -13,26 +13,23 @@ interface PageTemplate {
 
 @Injectable()
 export class ProductsService {
-  // segments/ids never change during a flash sale (product catalog is static) —
-  // safe to hold per-instance without any invalidation for L1.
-  private readonly l1 = new Map<string, PageTemplate>();
-
   constructor(
     @InjectRepository(Product) private readonly productRepo: Repository<Product>,
     @Inject(REDIS_CLIENT) private readonly redis: Redis,
     private readonly metrics: MetricsService,
   ) {}
 
+  // Cache-Aside on Redis only — no in-process cache. A worker's
+  // invalidateTemplates() then takes effect atomically for every api instance,
+  // and there is nothing per-instance that can serve a stale remainingStock.
   async getPage(page: number, limit: number): Promise<string> {
     const key = `${page}:${limit}`;
-    let tpl = this.l1.get(key);
+    let tpl = await this.loadFromCache(key);
     if (tpl) {
-      this.metrics.increment('cache_l1_hit');
+      this.metrics.increment('cache_hit');
     } else {
-      const fromL2 = await this.loadFromL2(key);
-      this.metrics.increment(fromL2 ? 'cache_l2_hit' : 'cache_miss');
-      tpl = fromL2 ?? (await this.buildTemplate(page, limit, key));
-      this.l1.set(key, tpl);
+      this.metrics.increment('cache_miss');
+      tpl = await this.buildTemplate(page, limit, key);
     }
 
     if (tpl.ids.length === 0) return tpl.segments[0];
@@ -45,11 +42,11 @@ export class ProductsService {
     return out;
   }
 
-  // Called by the worker after a committed stock deduction, per the documented
-  // cache-invalidation strategy (product fields other than remainingStock —
-  // which is never cached — are cheap to fully re-derive on next request).
+  // Called by the worker after a committed stock deduction. Deleting the Redis
+  // template keys is the whole invalidation — the next request on any instance
+  // rebuilds from Postgres. (remainingStock is never in the template; it is
+  // spliced in live from cache:stock:* on every request.)
   async invalidateTemplates(): Promise<void> {
-    this.l1.clear();
     let cursor = '0';
     do {
       const [next, keys] = await this.redis.scan(cursor, 'MATCH', 'cache:template:*', 'COUNT', 100);
@@ -58,7 +55,7 @@ export class ProductsService {
     } while (cursor !== '0');
   }
 
-  private async loadFromL2(key: string): Promise<PageTemplate | null> {
+  private async loadFromCache(key: string): Promise<PageTemplate | null> {
     const raw = await this.redis.get(`cache:template:${key}`);
     return raw ? (JSON.parse(raw) as PageTemplate) : null;
   }
