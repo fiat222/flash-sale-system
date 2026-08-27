@@ -47,10 +47,11 @@ services:
     deploy:
       resources:
         limits:
-          # Single nginx worker (see nginx.conf). At 0.5 it was CFS-throttled
-          # ~99% at the 1,000-VU read peak (nr_throttled 3167). 0.85 clears the
-          # throttle with headroom (measured ~0.82 core at peak). Budget comes
-          # from postgres, which is fully idle on the read path (0.75->0.4).
+          # Single nginx worker (see nginx.conf). ~84% at the 1,000-VU read
+          # peak with occasional CFS throttle; a 1.0 bump was measured to give
+          # nothing (p95 288->292) so it stays at 0.85 and the budget goes to
+          # redis instead — which is now on both the read (GET + MGET per
+          # request, no more in-process cache) and write hot paths.
           cpus: "0.85"
           memory: 64M
 
@@ -107,8 +108,8 @@ services:
     deploy:
       resources:
         limits:
-          # Drains ~50 jobs (concurrency 15) per write burst; 0.4 is ample.
-          cpus: "0.4"
+          # Drains ~50 jobs (concurrency 15) per write burst — needs ~0.3 core.
+          cpus: "0.35"
           memory: 300M
 
   migrate:
@@ -137,6 +138,7 @@ services:
       -c shared_buffers=192MB
       -c max_connections=60
       -c work_mem=4MB
+      -c synchronous_commit=off
     volumes:
       # postgres:18+ images store data under /var/lib/postgresql directly
       # (pg_ctlcluster-style layout) — mounting .../data breaks first boot.
@@ -150,8 +152,8 @@ services:
     deploy:
       resources:
         limits:
-          # Read path never touches postgres (served fully from L1/L2 cache);
-          # write path only does ~50 short locked txns. 0.35 is ample.
+          # Read path never touches postgres (served from the Redis template
+          # cache); write path only does ~50 short locked txns. 0.35 is ample.
           cpus: "0.35"
           memory: 900M
 
@@ -169,10 +171,11 @@ services:
     deploy:
       resources:
         limits:
-          # Measured: redis throttle is negligible (nr_throttled ~23,
-          # throttled_usec ~0.4s) even at 0.4 — it is NOT the write bottleneck.
-          # 0.45 keeps a small margin; the reclaimed budget goes to the api tier.
-          cpus: "0.45"
+          # Redis is on both hot paths now: every read is GET (template) + MGET
+          # (stock) since the in-process cache was removed, and every write is a
+          # Lua claim + BullMQ enqueue. Dropping this to 0.30 pushed write p95
+          # 377 -> 912ms. 0.5 restores headroom for the 500-way write burst.
+          cpus: "0.5"
           memory: 350M
 
 volumes:
