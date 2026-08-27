@@ -178,54 +178,6 @@ services:
           cpus: "0.5"
           memory: 350M
 
-  # ---- Observability (opt-in) ---------------------------------------------
-  # Not part of the graded 1-click stack — start only with:
-  #   docker compose -f deploy/docker-compose.yml --profile observability up -d
-  # Run this on a tester machine, not the 4-core VM.
-
-  grafana:
-    image: grafana/grafana:11.3.0
-    profiles: ["observability"]
-    ports:
-      - "3002:3000"
-    env_file: .env
-    environment:
-      # Anonymous view so the dashboard opens with no login (screenshot-friendly).
-      GF_AUTH_ANONYMOUS_ENABLED: "true"
-      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
-      GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: admin
-      GF_USERS_DEFAULT_THEME: light
-    volumes:
-      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
-    depends_on:
-      postgres:
-        condition: service_healthy
-    restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          cpus: "0.5"
-          memory: 256M
-
-  adminer:
-    image: adminer:4
-    profiles: ["observability"]
-    ports:
-      - "8081:8080"
-    environment:
-      ADMINER_DEFAULT_SERVER: postgres
-    depends_on:
-      postgres:
-        condition: service_healthy
-    restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          cpus: "0.25"
-          memory: 64M
-
 volumes:
   postgres-data:
   redis-data:

@@ -83,33 +83,26 @@ its 500 tokens from `lib/auth.js` in `setup()`.
 Completed tab shows the last 1,000 finished jobs (50 after one `flash-sale.js`
 run). `reset.js` flushes them.
 
-## Correctness check after each run
+## Data Integrity Proof (capture the database)
 
-```sql
-SELECT remaining_stock FROM products WHERE product_id = 'p-1001';        -- expect 0
-SELECT COUNT(*), COUNT(DISTINCT user_id) FROM orders WHERE product_id = 'p-1001';  -- expect 50 / 50
-```
-
-### Data Integrity dashboard (Grafana, reads Postgres live)
-
-For the "capture the database" deliverable, an opt-in Grafana dashboard renders
-the final DB state as stat tiles (green/red thresholds) + tables — no manual SQL.
+Postgres is not exposed outside the VM by design, so this is a direct psql
+snapshot — run it on the VM (or over SSH) after a `flash-sale.js` run and
+screenshot the output:
 
 ```bash
-docker compose -f deploy/docker-compose.yml --profile observability up -d
+docker compose -f deploy/docker-compose.yml exec postgres \
+  psql -U flash_sale -d flash_sale -c "
+    SELECT remaining_stock FROM products WHERE product_id = 'p-1001';          -- expect 0, never < 0
+    SELECT COUNT(*)          AS orders,
+           COUNT(DISTINCT user_id) AS distinct_buyers,
+           COALESCE(MAX(c),0) AS max_per_user
+      FROM (SELECT COUNT(*) c FROM orders WHERE product_id='p-1001' GROUP BY user_id) t;  -- expect 50 / 50 / 1
+    SELECT user_id, created_at FROM orders WHERE product_id='p-1001' ORDER BY created_at;  -- 50 distinct rows
+  "
 ```
 
-- **Grafana** <http://localhost:3002> → dashboard **Flash Sale — Data Integrity**
-  (anonymous view, no login). Panels, all reading `products` / `orders` directly:
-  `remaining_stock` (expect 0), `orders` (50), `distinct buyers` (50),
-  `max orders per user` (1), `|(available-remaining) - orders|` (0),
-  `users with > 1 order` (0), cumulative-orders timeline, plus raw `products`
-  and `orders` tables. `$product` textbox var switches the target product.
-- **Adminer** <http://localhost:8081> (server `postgres`, db/user/pass from
-  `deploy/.env`) for ad-hoc SQL.
-
-Not part of the graded 1-click stack — the `observability` profile is separate
-and should run on a tester machine, not the 4-core VM.
+`products` also has a `CHECK (remaining_stock >= 0)` constraint — a negative
+value is impossible at the DB level, not just unlikely.
 
 ## Reset
 
