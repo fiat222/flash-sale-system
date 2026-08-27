@@ -1,13 +1,9 @@
 import { ConflictException, Inject, Injectable } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
-import { readFileSync } from 'fs';
-import { join } from 'path';
 import Redis from 'ioredis';
 import { REDIS_CLIENT } from '../redis/redis.provider';
 import { MetricsService } from '../metrics/metrics.service';
-
-const CLAIM_STOCK_SCRIPT = readFileSync(join(__dirname, 'lua/claim-stock.lua'), 'utf-8');
 
 export interface OrderJobData {
   userId: string;
@@ -23,9 +19,7 @@ export class OrdersService {
   ) {}
 
   async claim(userId: string, productId: string) {
-    const result = (await this.redis.eval(
-      CLAIM_STOCK_SCRIPT,
-      2,
+    const result = (await (this.redis as any).claimStock(
       `cache:claim:${productId}`,
       `cache:stock:${productId}`,
       userId,
