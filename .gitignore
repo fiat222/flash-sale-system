@@ -37,3 +37,4 @@ coverage/
 loadtest/results/
 loadtest/*.json
 !loadtest/**/config.json
+loadtest.zip

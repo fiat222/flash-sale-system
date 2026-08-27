@@ -10,5 +10,8 @@
     "@commitlint/cli": "^19.5.0",
     "@commitlint/config-conventional": "^19.5.0",
     "husky": "^9.1.6"
+  },
+  "dependencies": {
+    "k6": "^0.0.0"
   }
 }

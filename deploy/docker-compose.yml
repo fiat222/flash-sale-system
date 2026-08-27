@@ -18,6 +18,8 @@ x-api-common: &api-common
   deploy:
     resources:
       limits:
+        # api is the read hot path (template assembly + redis mget). Cutting
+        # this below 0.65 moves the bottleneck here and makes p95 bimodal.
         cpus: "0.65"
         memory: 350M
 
@@ -36,7 +38,11 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.5"
+          # Single nginx worker (see nginx.conf). At 0.5 it was CFS-throttled
+          # ~99% at the 1,000-VU read peak (nr_throttled 3167). 0.85 clears the
+          # throttle with headroom (measured ~0.82 core at peak). Budget comes
+          # from postgres, which is fully idle on the read path (0.75->0.4).
+          cpus: "0.85"
           memory: 64M
 
   api1:
@@ -118,7 +124,10 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.75"
+          # Read path never touches postgres (served fully from L1/L2 cache);
+          # write path only does ~50 short locked txns. 0.4 is ample and frees
+          # budget for nginx.
+          cpus: "0.4"
           memory: 900M
 
   redis:

@@ -1,8 +1,23 @@
 import http from 'k6/http';
-import { check } from 'k6';
+import { check, sleep } from 'k6';
 
 const BASE_URL = __ENV.BASE_URL || 'http://localhost';
+// MIX=1 restores the old randomised page/limit + 5% garbage-input variant used
+// for clamp-path robustness testing. Default is the exact spec request so the
+// L1/L2/miss ratio in GET /api/v1/_metrics stays clean (one template key).
+const MIX = __ENV.MIX === '1';
 const LIMITS = [10, 20, 50];
+
+// ---- Tunables (all env-overridable) ----------------------------------------
+const TARGET = Number(__ENV.TARGET || 1000); // peak concurrent VUs
+const RAMP = __ENV.RAMP || '10s'; // 0 -> TARGET
+const HOLD = __ENV.HOLD || '35s'; // plateau at TARGET
+const RAMPDOWN = __ENV.RAMPDOWN || '5s'; // TARGET -> 0
+const REQ_TIMEOUT = __ENV.REQ_TIMEOUT || '10s'; // per-request HTTP timeout (k6 default is 60s)
+// Total run time = RAMP + HOLD + RAMPDOWN = ~50s. Long soak: -e HOLD=1m -e RAMP=30s
+// --------------------------------------------------------------------------
+
+const PARAMS = { timeout: REQ_TIMEOUT };
 
 export const options = {
   scenarios: {
@@ -10,9 +25,9 @@ export const options = {
       executor: 'ramping-vus',
       startVUs: 0,
       stages: [
-        { duration: '30s', target: 1000 },
-        { duration: '1m', target: 1000 },
-        { duration: '15s', target: 0 },
+        { duration: RAMP, target: TARGET },
+        { duration: HOLD, target: TARGET },
+        { duration: RAMPDOWN, target: 0 },
       ],
     },
   },
@@ -37,20 +52,23 @@ function safeJson(r) {
 }
 
 export default function () {
-  let page;
-  let limit;
+  // Spec: GET /api/v1/products?page=1&limit=10, 1,000 concurrent users.
+  let page = 1;
+  let limit = 10;
 
-  // 5% of requests send garbage input to exercise the clamp-to-default path
-  // documented in the architecture doc (page=-5, limit=abc must not 500).
-  if (Math.random() < 0.05) {
-    page = Math.random() < 0.5 ? -5 : 99999;
-    limit = 'abc';
-  } else {
-    page = randInt(1, 3);
-    limit = LIMITS[randInt(0, LIMITS.length - 1)];
+  if (MIX) {
+    // 5% of requests send garbage input to exercise the clamp-to-default path
+    // documented in the architecture doc (page=-5, limit=abc must not 500).
+    if (Math.random() < 0.05) {
+      page = Math.random() < 0.5 ? -5 : 99999;
+      limit = 'abc';
+    } else {
+      page = randInt(1, 3);
+      limit = LIMITS[randInt(0, LIMITS.length - 1)];
+    }
   }
 
-  const res = http.get(`${BASE_URL}/api/v1/products?page=${page}&limit=${limit}`);
+  const res = http.get(`${BASE_URL}/api/v1/products?page=${page}&limit=${limit}`, PARAMS);
 
   check(res, {
     'status is 200': (r) => r.status === 200,
@@ -65,4 +83,32 @@ export default function () {
       return !!body && Array.isArray(body.data) && body.data.length <= body.meta.limit;
     },
   });
+}
+
+// Report requirement #1 (Cache Performance): print the L1/L2/miss counters and
+// the derived hit ratio straight from the API so the run is self-documenting.
+export function teardown() {
+  sleep(2); // MetricsService flushes in-memory counters to Redis once a second
+  const res = http.get(`${BASE_URL}/api/v1/_metrics`, PARAMS);
+  let m = {};
+  try {
+    m = res.json('metrics') || {};
+  } catch (e) {
+    console.log('teardown: could not read /api/v1/_metrics');
+    return;
+  }
+
+  const l1 = m.cache_l1_hit || 0;
+  const l2 = m.cache_l2_hit || 0;
+  const miss = m.cache_miss || 0;
+  const hits = l1 + l2;
+  const total = hits + miss;
+  const pct = (n) => (total ? ((n / total) * 100).toFixed(2) : '0.00');
+
+  console.log('--- Cache Performance (GET /api/v1/_metrics) ---');
+  console.log(`lookups total : ${total}`);
+  console.log(`cache_l1_hit  : ${l1} (${pct(l1)}%)`);
+  console.log(`cache_l2_hit  : ${l2} (${pct(l2)}%)`);
+  console.log(`cache_miss    : ${miss} (${pct(miss)}%)`);
+  console.log(`HIT / MISS    : ${pct(hits)}% hit  /  ${pct(miss)}% miss   (${hits} hit / ${miss} miss)`);
 }
