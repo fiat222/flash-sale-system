@@ -22,13 +22,7 @@ k6 has a built-in dashboard — no Grafana/InfluxDB, no extra containers, and ze
 load on the system under test (the dashboard is served from the k6 process).
 
 ```bash
-docker run --rm --network flash-sale-system_default \
-  -v "$PWD/loadtest:/loadtest" -w / -p 5665:5665 \
-  -e BASE_URL=http://nginx \
-  -e K6_WEB_DASHBOARD=true \
-  -e K6_WEB_DASHBOARD_EXPORT=/loadtest/results/report.html \
-  -e K6_WEB_DASHBOARD_PERIOD=2s \
-  grafana/k6 run /loadtest/flash-sale.js
+docker run --rm --network flash-sale-system_default -v "$PWD/loadtest:/loadtest" -w / -p 5665:5665 -e BASE_URL=http://nginx -e K6_WEB_DASHBOARD=true -e K6_WEB_DASHBOARD_EXPORT=/loadtest/results/report.html -e K6_WEB_DASHBOARD_PERIOD=2s grafana/k6 run /loadtest/flash-sale.js
 ```
 
 - **during the run:** open <http://localhost:5665> — live req/s, p95/p99, VUs,
@@ -95,6 +89,27 @@ run). `reset.js` flushes them.
 SELECT remaining_stock FROM products WHERE product_id = 'p-1001';        -- expect 0
 SELECT COUNT(*), COUNT(DISTINCT user_id) FROM orders WHERE product_id = 'p-1001';  -- expect 50 / 50
 ```
+
+### Data Integrity dashboard (Grafana, reads Postgres live)
+
+For the "capture the database" deliverable, an opt-in Grafana dashboard renders
+the final DB state as stat tiles (green/red thresholds) + tables — no manual SQL.
+
+```bash
+docker compose -f deploy/docker-compose.yml --profile observability up -d
+```
+
+- **Grafana** <http://localhost:3002> → dashboard **Flash Sale — Data Integrity**
+  (anonymous view, no login). Panels, all reading `products` / `orders` directly:
+  `remaining_stock` (expect 0), `orders` (50), `distinct buyers` (50),
+  `max orders per user` (1), `|(available-remaining) - orders|` (0),
+  `users with > 1 order` (0), cumulative-orders timeline, plus raw `products`
+  and `orders` tables. `$product` textbox var switches the target product.
+- **Adminer** <http://localhost:8081> (server `postgres`, db/user/pass from
+  `deploy/.env`) for ad-hoc SQL.
+
+Not part of the graded 1-click stack — the `observability` profile is separate
+and should run on a tester machine, not the 4-core VM.
 
 ## Reset
 
