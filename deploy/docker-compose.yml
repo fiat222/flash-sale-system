@@ -27,8 +27,8 @@ x-api-common: &api-common
         # vs redis ~0.4s). Node is single-threaded, so we scale OUT to 5 smaller
         # instances instead of 3 bigger ones — 5 event loops absorb the 500-way
         # concurrent write spike better at ~the same total budget (5*0.45=2.25).
-        cpus: "0.45"
-        memory: 350M
+        cpus: "0.42"
+        memory: 512M
 
 services:
   nginx:
@@ -52,8 +52,8 @@ services:
           # nothing (p95 288->292) so it stays at 0.85 and the budget goes to
           # redis instead — which is now on both the read (GET + MGET per
           # request, no more in-process cache) and write hot paths.
-          cpus: "0.85"
-          memory: 64M
+          cpus: "0.80"
+          memory: 128M
 
   api1:
     <<: *api-common
@@ -109,8 +109,8 @@ services:
       resources:
         limits:
           # Drains ~50 jobs (concurrency 15) per write burst — needs ~0.3 core.
-          cpus: "0.35"
-          memory: 300M
+          cpus: "0.30"
+          memory: 384M
 
   migrate:
     image: ${BACKEND_IMAGE:-ghcr.io/fiat222/flash-sale-backend:latest}
@@ -155,7 +155,7 @@ services:
           # Read path never touches postgres (served from the Redis template
           # cache); write path only does ~50 short locked txns. 0.35 is ample.
           cpus: "0.35"
-          memory: 900M
+          memory: 1024M
 
   redis:
     image: redis:7-alpine
@@ -175,8 +175,8 @@ services:
           # (stock) since the in-process cache was removed, and every write is a
           # Lua claim + BullMQ enqueue. Dropping this to 0.30 pushed write p95
           # 377 -> 912ms. 0.5 restores headroom for the 500-way write burst.
-          cpus: "0.5"
-          memory: 350M
+          cpus: "0.4"
+          memory: 512M
 
 volumes:
   postgres-data:
