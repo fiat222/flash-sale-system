@@ -12,5 +12,7 @@ export const redisProvider: Provider = {
       host: config.get<string>('REDIS_HOST', 'localhost'),
       port: config.get<number>('REDIS_PORT', 6379),
       enableAutoPipelining: true,
+      maxRetriesPerRequest: 3,
+      connectTimeout: 2000,
     }),
 };

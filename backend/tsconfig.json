@@ -16,7 +16,8 @@
     "noImplicitAny": true,
     "strictBindCallApply": true,
     "forceConsistentCasingInFileNames": true,
-    "noFallthroughCasesInSwitch": true
+    "noFallthroughCasesInSwitch": true,
+    "types": ["jest"]
   },
   "watchOptions": {
     // Docker Desktop on Windows/Mac doesn't forward host filesystem events

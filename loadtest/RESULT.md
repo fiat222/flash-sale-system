@@ -1,48 +1,6 @@
 ## ผลลัพธ์การ read
 docker run --rm --network flash-sale-system_default -v ${PWD}/loadtest:/loadtest grafana/k6 run -e BASE_URL=http://nginx /loadtest/read.js
 
- THRESHOLDS 
-
-    http_req_duration
-    ✗ 'p(95)<500' p(95)=511.28ms
-
-    http_req_failed
-    ✓ 'rate<0.01' rate=0.14%
-
-
-  █ TOTAL RESULTS 
-
-    checks_total.......: 482013 4597.902007/s
-    checks_succeeded...: 99.85% 481314 out of 482013
-    checks_failed......: 0.14%  699 out of 482013
-
-    ✗ status is 200
-      ↳  99% — ✓ 160438 / ✗ 233
-    ✗ totalPages matches formula
-      ↳  99% — ✓ 160438 / ✗ 233
-    ✗ data length <= limit
-      ↳  99% — ✓ 160438 / ✗ 233
-
-    HTTP
-    http_req_duration..............: avg=530.52ms min=669.77µs med=316ms    max=59.86s p(90)=502.45ms p(95)=511.28ms
-      { expected_response:true }...: avg=445.65ms min=669.77µs med=315.83ms max=59.8s  p(90)=502.32ms p(95)=510.82ms
-    http_req_failed................: 0.14%  233 out of 160671
-    http_reqs......................: 160671 1532.634002/s
-
-    EXECUTION
-    iteration_duration.............: avg=533.18ms min=799.91µs med=316.4ms  max=1m0s   p(90)=502.82ms p(95)=511.57ms
-    iterations.....................: 160671 1532.634002/s
-    vus............................: 168    min=28            max=1000
-    vus_max........................: 1000   min=1000          max=1000
-
-    NETWORK
-    data_received..................: 185 MB 1.8 MB/s
-    data_sent......................: 15 MB  141 kB/s
-
-running (1m44.8s), 0000/1000 VUs, 160671 complete and 0 interrupted iterations
-read ✓ [ 100% ] 0000/1000 VUs  1m45s
-time="2026-08-26T04:40:08Z" level=error msg="thresholds on metrics 'http_req_duration' have been crossed"
-
 # สรุป
 
 ## Diagnosis: 233 request timeout (60s) ทุกรอบ
@@ -71,6 +29,38 @@ throttled_usec 439356193 ← สะสม ~439 วินาที
 nginx ถูก CFS throttle เกือบทุกช่วง 100ms — request ไม่ได้ถูก reject ที่ไหนเลย (เข้าใจได้ทันทีว่าทำไม kernel counter ทุกตัวที่เช็คไปก่อนหน้า — `ListenOverflows`, conntrack `drop` — เป็น 0 หมด) มันแค่**รอ nginx process ได้คิว CPU ครั้งถัดไป** ยิ่ง throttle นาน ยิ่งมี request ค้างพร้อมกันเป็นกลุ่ม ตรงกับ pattern ที่ timeout กระจุกตัวเป็นช่วง ~7-8 วินาทีสั้นๆ แทนที่จะกระจายทั่วทั้ง 105 วินาทีของการทดสอบ
 
 **Fix:** `deploy/docker-compose.yml` — เพิ่ม `nginx` cpus `0.25` → `0.5`, ลด `postgres` cpus `1.0` → `0.75` (postgres ไม่โดน read path แตะเลยตามที่ doc ระบุเอง มี headroom เหลือให้ดึงมาใช้ รวม budget เท่าเดิม 4.1 core ไม่เกิน host 4 vCPU)
+
+---
+
+## ผลลัพธ์การ write
+
+```
+node loadtest/reset.js
+docker run --rm --network flash-sale-system_default -v ${PWD}/loadtest:/loadtest grafana/k6 run -e BASE_URL=http://nginx /loadtest/write.js
+```
+
+# สรุป
+
+ผ่านทั้งสอง threshold รอบเดียว ไม่ต้องแก้อะไร
+
+## Correctness (หลัง queue drain)
+
+| เช็ค | คาดหวัง | ได้จริง |
+|---|---|---|
+| `SELECT remaining_stock FROM products WHERE product_id='p-1001'` | 0 | **0** |
+| `SELECT COUNT(*), COUNT(DISTINCT user_id) FROM orders WHERE product_id='p-1001'` | 50 / 50 | **50 / 50** |
+| Redis `GET cache:stock:p-1001` | 0 | **0** |
+| Redis `SCARD cache:claim:p-1001` | 50 | **50** |
+| Bull `ZCARD bull:orders:failed` | 0 | **0** |
+| `GET /api/v1/_metrics` | ตรงกับ k6 counter | **`{accepted:50, soldout:521, duplicate:5}`** ตรงเป๊ะ |
+
+**ไม่มี oversell, ไม่มี double-insert** — 50 order / 50 user ไม่ซ้ำ
+
+## หมายเหตุ
+
+- `orders_duplicate` = 5 (ไม่ใช่ ~50) เพราะ Redis stock ถึง 0 เร็วมาก กว่าที่ VU `%10==0` จะยิงรอบสอง stock หมดแล้ว → ได้ 409 soldout แทน duplicate เกือบทั้งหมด สิ่งที่พิสูจน์คือ SADD dedup กันไม่ให้ token เดิมถูก accept ซ้ำ ซึ่งได้ผล (accepted = 50 ตรงกับ stock พอดี ไม่เกิน)
+- p95 = 455ms เทียบ read path (373ms) สูงกว่าเพราะ write ผ่าน Lua claim + `queue.add` (Redis round trip เพิ่ม) แต่ยังต่ำกว่า threshold 800ms เยอะ
+- worker concurrency 15, queue drain < 5s สำหรับ 50 job
 
 **ผลยืนยันหลัง fix (รันเดียวกันทุกอย่าง):**
 

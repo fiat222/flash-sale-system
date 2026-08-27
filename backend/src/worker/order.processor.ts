@@ -7,6 +7,7 @@ import { Product } from '../database/entities/product.entity';
 import { Order } from '../database/entities/order.entity';
 import { REDIS_CLIENT } from '../redis/redis.provider';
 import { ProductsService } from '../products/products.service';
+import { MetricsService } from '../metrics/metrics.service';
 import { OrderJobData } from '../orders/orders.service';
 
 @Processor('orders', { concurrency: Number(process.env.WORKER_CONCURRENCY ?? 15) })
@@ -17,8 +18,17 @@ export class OrderProcessor extends WorkerHost {
     private readonly dataSource: DataSource,
     @Inject(REDIS_CLIENT) private readonly redis: Redis,
     private readonly productsService: ProductsService,
+    private readonly metrics: MetricsService,
   ) {
     super();
+  }
+
+  // Lifetime queue totals for the report (spec 3, Queue Monitoring). Bull-Board
+  // shows only the last N jobs (removeOnComplete/Fail); these counters don't
+  // decay.
+  @OnWorkerEvent('completed')
+  onCompleted(): void {
+    this.metrics.increment('orders_completed');
   }
 
   async process(job: Job<OrderJobData>): Promise<void> {
@@ -55,6 +65,11 @@ export class OrderProcessor extends WorkerHost {
   async onFailed(job: Job<OrderJobData> | undefined, err: Error): Promise<void> {
     if (!job) return;
     const attemptsExhausted = job.attemptsMade >= (job.opts.attempts ?? 1);
+    const terminal = attemptsExhausted || err instanceof UnrecoverableError;
+    if (terminal) this.metrics.increment('orders_failed');
+
+    // Compensation only for a transient failure that ran out of retries;
+    // unrecoverable ones (duplicate / sold-out) are final.
     if (!attemptsExhausted || err instanceof UnrecoverableError) return;
 
     const { userId, productId } = job.data;

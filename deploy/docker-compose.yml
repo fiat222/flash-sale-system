@@ -1,9 +1,14 @@
 name: flash-sale-system
 
 x-api-common: &api-common
+  # CI publishes this on push (.github/workflows/publish-image.yml). On the VM
+  # `docker compose pull` fetches it; `build:` is still here so a local
+  # `docker compose up --build` keeps working without the registry.
+  image: ${BACKEND_IMAGE:-ghcr.io/fiat222/flash-sale-backend:latest}
   build:
     context: ../backend
     dockerfile: Dockerfile
+    target: production
   env_file: .env
   environment:
     NODE_OPTIONS: ${NODE_OPTIONS}
@@ -18,7 +23,11 @@ x-api-common: &api-common
   deploy:
     resources:
       limits:
-        cpus: "0.65"
+        # api is the CPU bottleneck for BOTH phases (throttle counters: api ~80s
+        # vs redis ~0.4s). Node is single-threaded, so we scale OUT to 5 smaller
+        # instances instead of 3 bigger ones — 5 event loops absorb the 500-way
+        # concurrent write spike better at ~the same total budget (5*0.45=2.25).
+        cpus: "0.45"
         memory: 350M
 
 services:
@@ -32,11 +41,18 @@ services:
       - api1
       - api2
       - api3
+      - api4
+      - api5
     restart: unless-stopped
     deploy:
       resources:
         limits:
-          cpus: "0.5"
+          # Single nginx worker (see nginx.conf). ~84% at the 1,000-VU read
+          # peak with occasional CFS throttle; a 1.0 bump was measured to give
+          # nothing (p95 288->292) so it stays at 0.85 and the budget goes to
+          # redis instead — which is now on both the read (GET + MGET per
+          # request, no more in-process cache) and write hot paths.
+          cpus: "0.85"
           memory: 64M
 
   api1:
@@ -57,10 +73,24 @@ services:
       ROLE: api
       NODE_OPTIONS: ${NODE_OPTIONS}
 
+  api4:
+    <<: *api-common
+    environment:
+      ROLE: api
+      NODE_OPTIONS: ${NODE_OPTIONS}
+
+  api5:
+    <<: *api-common
+    environment:
+      ROLE: api
+      NODE_OPTIONS: ${NODE_OPTIONS}
+
   worker:
+    image: ${BACKEND_IMAGE:-ghcr.io/fiat222/flash-sale-backend:latest}
     build:
       context: ../backend
       dockerfile: Dockerfile
+      target: production
     env_file: .env
     environment:
       ROLE: worker
@@ -78,13 +108,16 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.5"
+          # Drains ~50 jobs (concurrency 15) per write burst — needs ~0.3 core.
+          cpus: "0.35"
           memory: 300M
 
   migrate:
+    image: ${BACKEND_IMAGE:-ghcr.io/fiat222/flash-sale-backend:latest}
     build:
       context: ../backend
       dockerfile: Dockerfile
+      target: production
     env_file: .env
     environment:
       ROLE: migrate
@@ -105,6 +138,7 @@ services:
       -c shared_buffers=192MB
       -c max_connections=60
       -c work_mem=4MB
+      -c synchronous_commit=off
     volumes:
       # postgres:18+ images store data under /var/lib/postgresql directly
       # (pg_ctlcluster-style layout) — mounting .../data breaks first boot.
@@ -118,7 +152,9 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.75"
+          # Read path never touches postgres (served from the Redis template
+          # cache); write path only does ~50 short locked txns. 0.35 is ample.
+          cpus: "0.35"
           memory: 900M
 
   redis:
@@ -135,7 +171,11 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.4"
+          # Redis is on both hot paths now: every read is GET (template) + MGET
+          # (stock) since the in-process cache was removed, and every write is a
+          # Lua claim + BullMQ enqueue. Dropping this to 0.30 pushed write p95
+          # 377 -> 912ms. 0.5 restores headroom for the 500-way write burst.
+          cpus: "0.5"
           memory: 350M
 
 volumes:

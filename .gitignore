@@ -37,3 +37,7 @@ coverage/
 loadtest/results/
 loadtest/*.json
 !loadtest/**/config.json
+loadtest.zip
+
+# keep results dir present for k6 handleSummary output
+!loadtest/results/.gitkeep

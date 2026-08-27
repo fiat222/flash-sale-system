@@ -21,7 +21,12 @@ async function runMigrate(): Promise<void> {
 }
 
 async function bootstrapHttp(): Promise<void> {
-  const app = await NestFactory.create<NestFastifyApplication>(AppModule, new FastifyAdapter());
+  const app = await NestFactory.create<NestFastifyApplication>(
+    AppModule,
+    // No per-request logging on the hot path — the load test drives thousands
+    // of req/s and Nest already logs bootstrap/errors separately.
+    new FastifyAdapter({ logger: false, disableRequestLogging: true }),
+  );
 
   app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
 

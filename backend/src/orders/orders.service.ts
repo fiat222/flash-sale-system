@@ -48,8 +48,10 @@ export class OrdersService {
         // BullMQ rejects ":" in custom job IDs (reserved for its own key
         // namespacing) — "|" still gives us the same deterministic dedup key.
         jobId: `${userId}|${productId}`,
-        removeOnComplete: true,
-        removeOnFail: 1000,
+        // Keep the last N terminal jobs so Bull-Board can show real
+        // Completed / Failed counts for the report (spec 3, Queue Monitoring).
+        removeOnComplete: { count: 1000 },
+        removeOnFail: { count: 1000 },
         attempts: 3,
         backoff: { type: 'exponential', delay: 200 },
       },

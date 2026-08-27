@@ -224,13 +224,15 @@ for (let i = 0; i < stocks.length; i++) out += stocks[i] + tpl.segments[i + 1];
 return out;  // ส่งเป็น string ตรงๆ ไม่ต้อง serialize
 ```
 
-**ทำไมถึงเร็ว:** ไม่มี `JSON.parse`/`JSON.stringify` เลย (CPU cost ที่ใหญ่ที่สุดของ JSON API), 1 Redis round trip ต่อ request, ไม่ต้อง invalidate อะไรเวลาสต็อกเปลี่ยนเพราะสต็อกไม่เคยอยู่ใน cache ตั้งแต่แรก — ไม่มี cache stampede ได้ในเชิงโครงสร้าง
+**ทำไมถึงเร็ว:** ไม่มี `JSON.parse`/`JSON.stringify` บน response path (แค่ต่อ string จาก segments), Redis สองครั้ง (`GET` template + `MGET` stock) ต่อ request ไม่แตะ Postgres, สต็อกไม่เคยอยู่ใน template cache — spliced สดทุกครั้ง ไม่มี cache stampede เชิงโครงสร้าง
 
-### 4.3 L1 in-process cache
+### 4.3 Cache tier — Redis เท่านั้น (ไม่มี in-process cache)
 
-`segments`/`ids` ไม่เปลี่ยนตลอด flash sale เก็บใน memory ของแต่ละ instance (Map ธรรมดา) หลัง warm-up แล้ว request ที่ hit เหลือแค่ Redis `MGET` หนึ่งครั้ง ไม่แตะทั้ง Postgres และ template
+กฎ requirement: **ห้ามใช้ in-memory-caching**. template (`segments`/`ids`) เก็บใน Redis key `cache:template:{page}:{limit}` อย่างเดียว — ทุก request ที่ hit = Redis `GET` (template) + `MGET` (stock) สอง round trip, ไม่แตะ Postgres
 
-**ตัวเลือกเสริม (aggressive mode, ทำเป็น env flag):** cache response string ที่ compose เสร็จแล้วทั้งก้อน TTL 50-100ms เหลือ 0 round trip แต่สต็อก stale ได้ไม่เกิน TTL — วัดทั้งสองแบบใส่รีพอร์ตเป็นตารางเทียบ
+ผลพลอยได้ที่สำคัญ: `invalidateTemplates()` ของ worker = `DEL cache:template:*` ครั้งเดียว → **ทุก api instance เห็น miss พร้อมกันทันที** ไม่มี copy per-instance ให้ค้าง stale (ตรงเงื่อนไข spec 2.2 "คืน remainingStock ที่ถูกต้องเสมอ" + "invalidate ทันที")
+
+**ไม่ทำ:** cache response string ทั้งก้อนแบบมี TTL — สต็อกจะ stale ได้ในช่วง TTL ก่อน invalidate เสร็จ ขัดกฎ
 
 ### 4.4 Pagination และการป้องกัน input มั่ว
 
@@ -395,7 +397,7 @@ FROM orders WHERE product_id = 'p-1001';                            -- ต้อ
 | คน | ขอบเขต | ส่งมอบ |
 |---|---|---|
 | A — Infrastructure | docker-compose, Nginx, Dockerfile, Postgres, migration + seed, health check, pool sizing | ระบบ 1-click start ที่ขึ้นครบทุก service |
-| B — Read path | products module, template cache, L1, pagination + input validation, metrics endpoint | `GET /products` ที่ไม่แตะ DB ใน steady state |
+| B — Read path | products module, Redis template cache (no in-process cache), pagination + input validation, metrics endpoint | `GET /products` ที่ไม่แตะ DB ใน steady state |
 | C — Write path | auth + JWT guard, orders controller, Lua script, BullMQ, worker, compensation, Bull-Board | `POST /orders` ที่ผ่าน integrity test |
 
 งานร่วม: k6 script, การรันทดสอบ, รีพอร์ต — A ควรเสร็จก่อนใน 2 วันแรกเพราะอีกสองคนถูกบล็อกอยู่
