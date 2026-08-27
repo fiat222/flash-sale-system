@@ -18,9 +18,11 @@ x-api-common: &api-common
   deploy:
     resources:
       limits:
-        # api is the read hot path (template assembly + redis mget). Cutting
-        # this below 0.65 moves the bottleneck here and makes p95 bimodal.
-        cpus: "0.65"
+        # api is the CPU bottleneck for BOTH phases (throttle counters: api ~80s
+        # vs redis ~0.4s). Node is single-threaded, so we scale OUT to 5 smaller
+        # instances instead of 3 bigger ones — 5 event loops absorb the 500-way
+        # concurrent write spike better at ~the same total budget (5*0.45=2.25).
+        cpus: "0.45"
         memory: 350M
 
 services:
@@ -34,6 +36,8 @@ services:
       - api1
       - api2
       - api3
+      - api4
+      - api5
     restart: unless-stopped
     deploy:
       resources:
@@ -63,6 +67,18 @@ services:
       ROLE: api
       NODE_OPTIONS: ${NODE_OPTIONS}
 
+  api4:
+    <<: *api-common
+    environment:
+      ROLE: api
+      NODE_OPTIONS: ${NODE_OPTIONS}
+
+  api5:
+    <<: *api-common
+    environment:
+      ROLE: api
+      NODE_OPTIONS: ${NODE_OPTIONS}
+
   worker:
     build:
       context: ../backend
@@ -84,7 +100,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.5"
+          # Drains ~50 jobs (concurrency 15) per write burst; 0.4 is ample.
+          cpus: "0.4"
           memory: 300M
 
   migrate:
@@ -125,9 +142,8 @@ services:
       resources:
         limits:
           # Read path never touches postgres (served fully from L1/L2 cache);
-          # write path only does ~50 short locked txns. 0.4 is ample and frees
-          # budget for nginx.
-          cpus: "0.4"
+          # write path only does ~50 short locked txns. 0.35 is ample.
+          cpus: "0.35"
           memory: 900M
 
   redis:
@@ -144,7 +160,10 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.4"
+          # Measured: redis throttle is negligible (nr_throttled ~23,
+          # throttled_usec ~0.4s) even at 0.4 — it is NOT the write bottleneck.
+          # 0.45 keeps a small margin; the reclaimed budget goes to the api tier.
+          cpus: "0.45"
           memory: 350M
 
 volumes:
