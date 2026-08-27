@@ -67,6 +67,17 @@ function main() {
   const metricKeys = scanKeys('cache:m:*');
   if (metricKeys.length) compose('exec', '-T', 'redis', 'redis-cli', 'DEL', ...metricKeys);
 
+  // Obliterate the BullMQ queue. removeOnComplete keeps the last 1,000 finished
+  // jobs, whose deterministic jobIds (`user-N|p-1001`) would otherwise dedup
+  // against the next run's queue.add — silently dropping those orders so Redis
+  // stock decrements but no DB row is ever written.
+  console.log('Clearing BullMQ orders queue (stale jobIds would dedup next run)...');
+  const bullKeys = scanKeys('bull:orders:*');
+  // DEL in chunks so a huge retained set doesn't blow the argv limit.
+  for (let i = 0; i < bullKeys.length; i += 400) {
+    compose('exec', '-T', 'redis', 'redis-cli', 'DEL', ...bullKeys.slice(i, i + 400));
+  }
+
   console.log('Reset complete.');
 }
 
