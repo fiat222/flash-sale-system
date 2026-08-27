@@ -7,6 +7,7 @@ same scripts — set `BASE_URL` env var, default `http://localhost`.
 node loadtest/reset.js               # reset DB + Redis state (stack must already be up)
 k6 run -e BASE_URL=http://localhost loadtest/read.js
 k6 run -e BASE_URL=http://localhost loadtest/write.js
+k6 run -e BASE_URL=http://localhost loadtest/flash-sale.js
 ```
 
 Run `reset.js` before every `write.js` run (and before `read.js` if you care about
