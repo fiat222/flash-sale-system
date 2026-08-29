@@ -23,14 +23,15 @@ x-api-common: &api-common
   deploy:
     resources:
       limits:
-        # 6 small instances (Node is single-threaded — scale OUT). VM is 4 vCPU
-        # / 6 GiB. Measured: with the nginx edge cache serving 100% of the read
-        # plateau the box sits at ~65% idle during reads and the api tier barely
-        # throttles (<1s / 45s). The real load is now the 500-way write burst
-        # (api claim + queue), so the budget shifts to the WRITE path:
-        #   6*0.35 + nginx 1.00 + redis 0.60 + pg 0.45 + worker 0.55 = 4.70.
-        cpus: "0.35"
-        memory: 384M
+        # 6 small instances (Node is single-threaded — scale OUT). VM is 4 vCPU /
+        # 6 GiB. The nginx edge cache serves 100% of the read plateau so the api
+        # tier is idle during reads — but the 500-concurrent POST /orders burst
+        # still lands fully on it (JWT verify + Redis claim + queue.add). Cutting
+        # api to 0.35 pushed write p95 716 -> 1092ms, so it goes back to 0.50.
+        #   6*0.50 + nginx 0.90 + redis 0.55 + pg 0.35 + worker 0.35 = 5.15
+        # ceilings; read and write peaks don't overlap (k6 writes start at 33s).
+        cpus: "0.50"
+        memory: 424M
 
 services:
   nginx:
@@ -55,11 +56,12 @@ services:
     deploy:
       resources:
         limits:
-          # Serves the ENTIRE read plateau from its own cache (2 workers) + one
-          # lua Redis GET per request for the version key. Measured ~0.7s throttle
-          # / 45s at 1.30, so 1.00 is ample and the core goes to the write path.
-          cpus: "1.40"
-          memory: 256M
+          # Serves the ENTIRE read plateau from tmpfs (3 workers). Version key is
+          # memoised in a lua_shared_dict (1s TTL) so there is no per-request
+          # Redis round trip. At 0.90 it was the only container still throttling
+          # (~9.4s / 45s) while the box sat ~78% idle — bumped to 1.80.
+          cpus: "1.80"
+          memory: 224M
 
   api1:
     <<: *api-common
@@ -121,9 +123,9 @@ services:
       resources:
         limits:
           # Drains ~50 jobs (concurrency 15) per write burst: DB txn + DEL page
-          # cache + INCR cache:ver each. Was throttled ~10.6s / 45s at 0.25 and
-          # dragged write p95 past 800ms — bumped to 0.55. Idle during reads.
-          cpus: "0.45"
+          # cache + INCR cache:ver each. Affects queue backlog, not the POST
+          # latency. 0.35 keeps the drain up with the burst.
+          cpus: "0.35"
           memory: 384M
 
   migrate:
@@ -167,11 +169,10 @@ services:
       resources:
         limits:
           # Read path never touches postgres (served from the edge cache); write
-          # path does ~50 short pessimistic-locked txns in a tight burst. Was
-          # throttled ~3.3s / 45s at 0.25, so bumped to 0.45.
+          # path does ~50 short pessimistic-locked txns in a tight burst.
           # max_connections=120 covers the pool worst case:
           # 6 api * POSTGRES_POOL_API(8) + worker * POSTGRES_POOL_WORKER(20) = 68.
-          cpus: "0.40"
+          cpus: "0.35"
           memory: 512M
 
   redis:
@@ -188,11 +189,10 @@ services:
     deploy:
       resources:
         limits:
-          # Redis is now on THREE hot paths: (1) nginx lua GET cache:ver per
-          # read request, (2) the page-cache GET on an edge miss, (3) the Lua
-          # claim + BullMQ enqueue per write. Bumped 0.45 -> 0.60 for the extra
-          # per-read version lookup the edge cache adds.
-          cpus: "0.60"
+          # Hot paths: (1) page-cache GET on an edge miss (rare — ~1/version),
+          # (2) lua cache:ver refill ~1/s/worker, (3) the Lua claim + BullMQ
+          # enqueue for all 500 concurrent writes. (3) dominates: 0.55.
+          cpus: "0.55"
           memory: 512M
 
 volumes:

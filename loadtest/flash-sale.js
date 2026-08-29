@@ -204,9 +204,10 @@ function tallyOrder(res) {
 // ============================ samplers ====================================
 function sampleCache(phase) {
   const m = fetchMetrics();
-  if (!m) return;
-  const hit = m.metrics.cache_hit || 0; // Redis template hit
-  const miss = m.metrics.cache_miss || 0; // Postgres rebuild
+  const mm = m && m.metrics;
+  if (!mm) return; // other groups may expose no /_metrics, or a different shape
+  const hit = mm.cache_hit || 0; // origin (Redis page cache) hit
+  const miss = mm.cache_miss || 0; // Postgres rebuild
   const total = hit + miss;
   if (!total) return;
   const hitPct = (hit / total) * 100;
@@ -215,9 +216,16 @@ function sampleCache(phase) {
 }
 
 function fetchMetrics() {
-  const res = http.get(`${BASE_URL}/api/v1/_metrics`, REQ);
+  let res;
   try {
-    return res.json();
+    res = http.get(`${BASE_URL}/api/v1/_metrics`, REQ);
+  } catch (e) {
+    return null;
+  }
+  if (!res || res.status !== 200) return null;
+  try {
+    const j = res.json();
+    return j && typeof j === 'object' ? j : null;
   } catch (e) {
     return null;
   }
