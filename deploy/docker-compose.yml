@@ -4,7 +4,7 @@ x-api-common: &api-common
   # CI publishes this on push (.github/workflows/publish-image.yml). On the VM
   # `docker compose pull` fetches it; `build:` is still here so a local
   # `docker compose up --build` keeps working without the registry.
-  image: ${BACKEND_IMAGE:-ghcr.io/fiat222/flash-sale-backend:latest}
+  image: ${BACKEND_IMAGE:-ghcr.io/fiat222/flash-sale-backend:sha-6feb9c5}
   build:
     context: ../backend
     dockerfile: Dockerfile
@@ -12,6 +12,8 @@ x-api-common: &api-common
   env_file: .env
   environment:
     NODE_OPTIONS: ${NODE_OPTIONS}
+  volumes:
+    - sockets:/sock          # api binds /sock/apiN.sock, nginx reads it
   depends_on:
     postgres:
       condition: service_healthy
@@ -23,67 +25,87 @@ x-api-common: &api-common
   deploy:
     resources:
       limits:
-        # api is the CPU bottleneck for BOTH phases (throttle counters: api ~80s
-        # vs redis ~0.4s). Node is single-threaded, so we scale OUT to 5 smaller
-        # instances instead of 3 bigger ones — 5 event loops absorb the 500-way
-        # concurrent write spike better at ~the same total budget (5*0.45=2.25).
-        cpus: "0.45"
-        memory: 350M
+        # 6 small instances (Node is single-threaded — scale OUT). VM is 4 vCPU
+        # / 6 GiB. Since the read hot path is now served from the nginx edge
+        # cache, the api tier's real load is the 500-way write burst, not the
+        # 2,600 rps read plateau. Read and write peaks don't overlap (k6 starts
+        # writes at 33s), so these ceilings can over-subscribe the 4 cores:
+        #   6*0.38 + nginx 1.30 + redis 0.60 + pg 0.25 + worker 0.25 = 4.65.
+        cpus: "0.38"
+        memory: 424M
 
 services:
   nginx:
-    image: nginx:alpine
+    # openresty = nginx + lua + lua-resty-redis (nginx.conf reads cache:ver
+    # from Redis per request to version the edge cache key).
+    image: openresty/openresty:alpine
     ports:
       - "${NGINX_PORT}:80"
     volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro
+      - sockets:/sock          # rw — connect() to a unix socket needs write perm
+    tmpfs:
+      - /var/cache/nginx:size=96m   # cache bodies in RAM
+      - /var/log/nginx:size=16m     # slow.log
     depends_on:
       - api1
       - api2
       - api3
       - api4
       - api5
+      - api6
     restart: unless-stopped
     deploy:
       resources:
         limits:
-          # Single nginx worker (see nginx.conf). ~84% at the 1,000-VU read
-          # peak with occasional CFS throttle; a 1.0 bump was measured to give
-          # nothing (p95 288->292) so it stays at 0.85 and the budget goes to
-          # redis instead — which is now on both the read (GET + MGET per
-          # request, no more in-process cache) and write hot paths.
-          cpus: "0.85"
-          memory: 64M
+          # Now serves the ENTIRE read plateau from its own cache (2 workers,
+          # see nginx.conf) plus one lua Redis GET per request for the version
+          # key. This is where the read-phase CPU moved to, so it gets the big
+          # slice the api tier used to hold.
+          cpus: "1.30"
+          memory: 192M
 
   api1:
     <<: *api-common
     environment:
       ROLE: api
       NODE_OPTIONS: ${NODE_OPTIONS}
+      API_SOCKET: /sock/api1.sock
 
   api2:
     <<: *api-common
     environment:
       ROLE: api
       NODE_OPTIONS: ${NODE_OPTIONS}
+      API_SOCKET: /sock/api2.sock
 
   api3:
     <<: *api-common
     environment:
       ROLE: api
       NODE_OPTIONS: ${NODE_OPTIONS}
+      API_SOCKET: /sock/api3.sock
 
   api4:
     <<: *api-common
     environment:
       ROLE: api
       NODE_OPTIONS: ${NODE_OPTIONS}
+      API_SOCKET: /sock/api4.sock
 
   api5:
     <<: *api-common
     environment:
       ROLE: api
       NODE_OPTIONS: ${NODE_OPTIONS}
+      API_SOCKET: /sock/api5.sock
+
+  api6:
+    <<: *api-common
+    environment:
+      ROLE: api
+      NODE_OPTIONS: ${NODE_OPTIONS}
+      API_SOCKET: /sock/api6.sock
 
   worker:
     image: ${BACKEND_IMAGE:-ghcr.io/fiat222/flash-sale-backend:latest}
@@ -108,9 +130,10 @@ services:
     deploy:
       resources:
         limits:
-          # Drains ~50 jobs (concurrency 15) per write burst — needs ~0.3 core.
-          cpus: "0.35"
-          memory: 300M
+          # Drains ~50 jobs (concurrency 15) per write burst + rebuilds the page
+          # cache and bumps cache:ver on each. Idle during the read plateau.
+          cpus: "0.25"
+          memory: 384M
 
   migrate:
     image: ${BACKEND_IMAGE:-ghcr.io/fiat222/flash-sale-backend:latest}
@@ -136,7 +159,7 @@ services:
     command: >
       postgres
       -c shared_buffers=192MB
-      -c max_connections=60
+      -c max_connections=120
       -c work_mem=4MB
       -c synchronous_commit=off
     volumes:
@@ -152,10 +175,12 @@ services:
     deploy:
       resources:
         limits:
-          # Read path never touches postgres (served from the Redis template
-          # cache); write path only does ~50 short locked txns. 0.35 is ample.
-          cpus: "0.35"
-          memory: 900M
+          # Read path never touches postgres (served from the edge cache); write
+          # path only does ~50 short locked txns. Observed ~0.05 core / 59MB.
+          # max_connections=120 covers the pool worst case:
+          # 6 api * POSTGRES_POOL_API(8) + worker * POSTGRES_POOL_WORKER(20) = 68.
+          cpus: "0.25"
+          memory: 512M
 
   redis:
     image: redis:7-alpine
@@ -171,13 +196,14 @@ services:
     deploy:
       resources:
         limits:
-          # Redis is on both hot paths now: every read is GET (template) + MGET
-          # (stock) since the in-process cache was removed, and every write is a
-          # Lua claim + BullMQ enqueue. Dropping this to 0.30 pushed write p95
-          # 377 -> 912ms. 0.5 restores headroom for the 500-way write burst.
-          cpus: "0.5"
-          memory: 350M
+          # Redis is now on THREE hot paths: (1) nginx lua GET cache:ver per
+          # read request, (2) the page-cache GET on an edge miss, (3) the Lua
+          # claim + BullMQ enqueue per write. Bumped 0.45 -> 0.60 for the extra
+          # per-read version lookup the edge cache adds.
+          cpus: "0.60"
+          memory: 512M
 
 volumes:
   postgres-data:
   redis-data:
+  sockets:        # unix domain sockets shared between nginx and api1..6

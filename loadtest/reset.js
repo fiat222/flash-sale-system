@@ -60,12 +60,21 @@ function main() {
     compose('exec', '-T', 'redis', 'redis-cli', 'DEL', `cache:claim:${p.productId}`);
   }
 
-  console.log('Clearing template + metrics cache so hit ratios start clean...');
-  const templateKeys = scanKeys('cache:template:*');
-  if (templateKeys.length) compose('exec', '-T', 'redis', 'redis-cli', 'DEL', ...templateKeys);
+  console.log('Clearing page/template/metrics cache so hit ratios start clean...');
+  const cacheKeys = [
+    ...scanKeys('cache:template:*'),
+    ...scanKeys('cache:page:*'),
+    ...scanKeys('cache:m:*'),
+    'cache:pagekeys',
+  ];
+  for (let i = 0; i < cacheKeys.length; i += 400) {
+    compose('exec', '-T', 'redis', 'redis-cli', 'DEL', ...cacheKeys.slice(i, i + 400));
+  }
 
-  const metricKeys = scanKeys('cache:m:*');
-  if (metricKeys.length) compose('exec', '-T', 'redis', 'redis-cli', 'DEL', ...metricKeys);
+  // Bump cache:ver to a fresh value so any body still sitting in the nginx edge
+  // cache from a previous run is keyed under an old version and never served.
+  // (Manual edge flush at any time:  redis-cli INCR cache:ver)
+  compose('exec', '-T', 'redis', 'redis-cli', 'SET', 'cache:ver', String(Date.now()));
 
   // Obliterate the BullMQ queue. removeOnComplete keeps the last 1,000 finished
   // jobs, whose deterministic jobIds (`user-N|p-1001`) would otherwise dedup

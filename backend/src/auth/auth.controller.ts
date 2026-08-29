@@ -1,8 +1,19 @@
-import { Body, Controller, HttpCode, HttpStatus, Post } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  HttpCode,
+  HttpStatus,
+  Post,
+  UsePipes,
+  ValidationPipe,
+} from '@nestjs/common';
 import { AuthService } from './auth.service';
 import { AuthTokenDto } from './dto/auth-token.dto';
 
 @Controller('api/v1/auth')
+// Pipe scoped per-controller (not app-global) so it never runs on the read hot
+// path — GET /api/v1/products has no DTO and does its own arg parsing.
+@UsePipes(new ValidationPipe({ whitelist: true, transform: true }))
 export class AuthController {
   constructor(private readonly authService: AuthService) {}
 

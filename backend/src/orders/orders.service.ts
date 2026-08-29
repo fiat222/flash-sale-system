@@ -14,22 +14,34 @@ export interface OrderJobData {
   productId: string;
 }
 
+// ioredis custom command — sends the script once as EVALSHA and only falls back
+// to a full EVAL on NOSCRIPT. Saves re-shipping the ~400B Lua body on every one
+// of the 500 concurrent claims in the write burst.
+interface RedisWithClaim extends Redis {
+  claimStock(claimKey: string, stockKey: string, userId: string): Promise<number>;
+}
+
 @Injectable()
 export class OrdersService {
+  private readonly redis: RedisWithClaim;
+
   constructor(
-    @Inject(REDIS_CLIENT) private readonly redis: Redis,
+    @Inject(REDIS_CLIENT) redis: Redis,
     @InjectQueue('orders') private readonly ordersQueue: Queue<OrderJobData>,
     private readonly metrics: MetricsService,
-  ) {}
+  ) {
+    this.redis = redis as RedisWithClaim;
+    if (typeof this.redis.claimStock !== 'function') {
+      this.redis.defineCommand('claimStock', { numberOfKeys: 2, lua: CLAIM_STOCK_SCRIPT });
+    }
+  }
 
   async claim(userId: string, productId: string) {
-    const result = (await this.redis.eval(
-      CLAIM_STOCK_SCRIPT,
-      2,
+    const result = await this.redis.claimStock(
       `cache:claim:${productId}`,
       `cache:stock:${productId}`,
       userId,
-    )) as number;
+    );
 
     if (result === -1) {
       this.metrics.increment('orders_duplicate');
