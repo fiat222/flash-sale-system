@@ -44,4 +44,18 @@ export class MetricsService implements OnModuleInit, OnModuleDestroy {
     });
     return out;
   }
+
+  // Live remaining stock per product + the edge-cache version, for the dashboard.
+  async stockSnapshot(): Promise<{ stock: Record<string, number>; version: string }> {
+    const keys = await this.redis.keys('cache:stock:*');
+    const [values, version] = await Promise.all([
+      keys.length ? this.redis.mget(keys) : Promise.resolve([]),
+      this.redis.get('cache:ver'),
+    ]);
+    const stock: Record<string, number> = {};
+    keys.forEach((k, i) => {
+      stock[k.replace('cache:stock:', '')] = Number(values[i] ?? 0);
+    });
+    return { stock, version: version ?? '0' };
+  }
 }
