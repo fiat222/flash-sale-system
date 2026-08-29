@@ -10,7 +10,7 @@ import { ProductsService } from '../products/products.service';
 import { MetricsService } from '../metrics/metrics.service';
 import { OrderJobData } from '../orders/orders.service';
 
-@Processor('orders', { concurrency: Number(process.env.WORKER_CONCURRENCY ?? 15) })
+@Processor('orders', { concurrency: Number(process.env.WORKER_CONCURRENCY ?? 25) })
 export class OrderProcessor extends WorkerHost {
   private readonly logger = new Logger(OrderProcessor.name);
 
