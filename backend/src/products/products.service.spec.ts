@@ -15,6 +15,7 @@ describe('ProductsService', () => {
     incr: jest.Mock;
     smembers: jest.Mock;
     sadd: jest.Mock;
+    del: jest.Mock;
     pipeline: jest.Mock;
   };
   let repo: { findAndCount: jest.Mock };
@@ -31,6 +32,7 @@ describe('ProductsService', () => {
       incr: jest.fn().mockResolvedValue(1),
       smembers: jest.fn().mockResolvedValue([]),
       sadd: jest.fn(),
+      del: jest.fn().mockResolvedValue(1),
       // pipeline().set().sadd().exec() — writes straight through to the store
       pipeline: jest.fn(() => {
         const p: Record<string, (...a: unknown[]) => unknown> = {
@@ -93,17 +95,14 @@ describe('ProductsService', () => {
     expect(redis.mget).not.toHaveBeenCalled();
   });
 
-  it('invalidate() rebuilds every known page then bumps the version key', async () => {
-    redis.smembers.mockResolvedValue(['1:10']);
-    store.set(
-      'cache:template:1:10',
-      JSON.stringify({ segments: ['{"data":[', ']}'], ids: ['p-1001'] }),
-    );
-    redis.mget.mockResolvedValue(['0']);
+  it('invalidate() drops every known page cache then bumps the version key', async () => {
+    redis.smembers.mockResolvedValue(['1:10', '2:10']);
+    store.set('cache:page:1:10', 'stale');
+    store.set('cache:page:2:10', 'stale');
 
     await service.invalidate();
 
-    expect(store.get('cache:page:1:10')).toBe('{"data":[0]}');
+    expect(redis.del).toHaveBeenCalledWith('cache:page:1:10', 'cache:page:2:10');
     expect(redis.incr).toHaveBeenCalledWith('cache:ver');
   });
 });

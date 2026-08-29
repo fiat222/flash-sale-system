@@ -71,13 +71,21 @@ export class ProductsService {
     return out;
   }
 
-  // Invalidation = rebuild every page (so the edge/Node caches are correct
-  // immediately, per spec 2.2) then bump the version the nginx edge keys off.
-  // ORDER MATTERS: pages are refreshed BEFORE `cache:ver` moves, so the first
-  // request on the new version can only ever read fresh page JSON.
+  // Invalidation (spec 2.2). ORDER MATTERS:
+  //   1. drop every cache:page:* — the next read rebuilds it from the row
+  //      template + live cache:stock:* (which the Lua claim already decremented),
+  //      so it can only ever come back fresh.
+  //   2. THEN bump cache:ver — the key the nginx edge cache is versioned on.
+  // A request landing on the new version therefore misses the edge, misses the
+  // (now-deleted) page cache, and rebuilds from current data. Deleting instead
+  // of rebuilding keeps the worker cheap during the 500-way write burst; the
+  // read plateau has ramped down by the time these fire, and proxy_cache_lock
+  // collapses the rebuild to one origin request per version anyway.
   async invalidate(): Promise<void> {
     const keys = await this.redis.smembers(K_PAGEKEYS);
-    await Promise.all(keys.map((key) => this.rebuildPage(key)));
+    if (keys.length) {
+      await this.redis.del(...keys.map(K_PAGE));
+    }
     await this.redis.incr(K_VERSION);
   }
 
