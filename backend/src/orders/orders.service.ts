@@ -64,8 +64,8 @@ export class OrdersService {
         // Completed / Failed counts for the report (spec 3, Queue Monitoring).
         removeOnComplete: { count: 100 },
         removeOnFail: { count: 100 },
-        attempts: 3,
-        backoff: { type: 'exponential', delay: 200 },
+        attempts: 2,
+        backoff: { type: 'fixed', delay: 50 },
       },
     );
 

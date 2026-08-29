@@ -5,7 +5,7 @@ import { Order } from './entities/order.entity';
 
 const poolSize =
   process.env.ROLE === 'worker'
-    ? Number(process.env.POSTGRES_POOL_WORKER ?? 20)
+    ? Number(process.env.POSTGRES_POOL_WORKER ?? 25)
     : Number(process.env.POSTGRES_POOL_API ?? 10);
 
 export const AppDataSource = new DataSource({
