@@ -65,7 +65,7 @@ export class OrdersService {
         removeOnComplete: { count: 100 },
         removeOnFail: { count: 100 },
         attempts: 2,
-        backoff: { type: 'fixed', delay: 50 },
+        backoff: { type: 'exponential', delay: 200 },
       },
     );
 
