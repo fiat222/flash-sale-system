@@ -30,7 +30,7 @@ x-api-common: &api-common
         # (api claim + queue), so the budget shifts to the WRITE path:
         #   6*0.35 + nginx 1.00 + redis 0.60 + pg 0.45 + worker 0.55 = 4.70.
         cpus: "0.35"
-        memory: 424M
+        memory: 384M
 
 services:
   nginx:
@@ -58,8 +58,8 @@ services:
           # Serves the ENTIRE read plateau from its own cache (2 workers) + one
           # lua Redis GET per request for the version key. Measured ~0.7s throttle
           # / 45s at 1.30, so 1.00 is ample and the core goes to the write path.
-          cpus: "1.00"
-          memory: 192M
+          cpus: "1.40"
+          memory: 256M
 
   api1:
     <<: *api-common
@@ -123,7 +123,7 @@ services:
           # Drains ~50 jobs (concurrency 15) per write burst: DB txn + DEL page
           # cache + INCR cache:ver each. Was throttled ~10.6s / 45s at 0.25 and
           # dragged write p95 past 800ms — bumped to 0.55. Idle during reads.
-          cpus: "0.55"
+          cpus: "0.45"
           memory: 384M
 
   migrate:
@@ -171,7 +171,7 @@ services:
           # throttled ~3.3s / 45s at 0.25, so bumped to 0.45.
           # max_connections=120 covers the pool worst case:
           # 6 api * POSTGRES_POOL_API(8) + worker * POSTGRES_POOL_WORKER(20) = 68.
-          cpus: "0.45"
+          cpus: "0.40"
           memory: 512M
 
   redis:
