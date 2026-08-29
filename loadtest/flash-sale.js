@@ -62,7 +62,6 @@ const ordersSoldout = new Counter('orders_soldout'); // HTTP 409 "Product sold o
 const ordersDuplicate = new Counter('orders_duplicate'); // HTTP 409 already-claimed
 const readCacheHitPct = new Trend('read_cache_hit_pct'); // sampled during read phase
 const writeQueueBacklog = new Trend('write_queue_backlog'); // waiting+active, sampled during write
-const edgeCacheHit = new Rate('edge_cache_hit'); // nginx X-Cache: HIT vs miss/expired
 const dataIntegrityOk = new Rate('data_integrity_ok'); // post-burst remainingStock == 0
 
 const REQ = { timeout: REQ_TIMEOUT };
@@ -135,9 +134,6 @@ export function setup() {
 // ============================ 2. read phase ===============================
 export function readScenario() {
   const res = http.get(`${BASE_URL}/api/v1/products?page=1&limit=10`, { ...REQ, tags: { name: 'products' } });
-
-  // nginx edge cache effectiveness (spec §3.1 cache hit ratio, L1/edge tier)
-  edgeCacheHit.add(res.headers['X-Cache'] === 'HIT');
 
   check(res, {
     'read: status 200': (r) => r.status === 200,
@@ -249,7 +245,7 @@ export function teardown() {
 
   // Data Integrity Proof (spec §3.4): once the queue is drained, the read API
   // must report remainingStock === 0 for the contended product — proves the
-  // edge + Redis cache was invalidated correctly and never served a stale count.
+  // Redis cache was invalidated correctly and never served a stale count.
   let integrityLine = '  remainingStock after drain : (not checked)';
   {
     const res = http.get(`${BASE_URL}/api/v1/products?page=1&limit=10`, REQ);
@@ -340,8 +336,7 @@ export function handleSummary(data) {
     `    requests ......... ${g('http_reqs', 'count')}   (${f2(g('http_reqs', 'rate'))}/s overall)`,
     `    p95 latency ...... ${f2(g(rd, 'p(95)'))} ms   (p99 ${f2(g(rd, 'p(99)'))} ms, max ${f2(g(rd, 'max'))} ms)`,
     `    checks .......... ${f2(g('checks{scenario:read_load}', 'rate') * 100)}% pass`,
-    `    edge cache hit ... ${f2(g('edge_cache_hit', 'rate') * 100)}% (nginx X-Cache)`,
-    `    origin cache hit . ${f2(g('read_cache_hit_pct', 'avg'))}% avg (Redis page cache, sampled)`,
+    `    cache hit ........ ${f2(g('read_cache_hit_pct', 'avg'))}% avg (Redis cache-aside, sampled)`,
     '',
     '  WRITE PHASE',
     `    orders accepted .. ${g('orders_accepted', 'count')}   (expect 50)`,

@@ -43,13 +43,12 @@ export const DASHBOARD_HTML = `<!doctype html>
   <h1>Flash Sale — Metrics</h1>
   <span class="meta"><span id="dot" class="dot"></span><span id="status">connecting…</span></span>
   <span class="meta">refresh 1s · <code>/api/v1/_metrics</code></span>
-  <span class="meta" id="ver"></span>
 </header>
 <main>
   <div class="card">
-    <h2>Origin cache hit ratio</h2>
+    <h2>Cache hit ratio</h2>
     <div class="big" id="hitpct">–</div>
-    <div class="sub" id="hitraw">hit 0 / miss 0 (Redis page cache, post-edge)</div>
+    <div class="sub" id="hitraw">hit 0 / miss 0 (Redis cache-aside)</div>
     <div class="bar"><span id="hitbar" style="width:0%"></span></div>
   </div>
 
@@ -99,7 +98,7 @@ export const DASHBOARD_HTML = `<!doctype html>
       var hit = m.cache_hit || 0, miss = m.cache_miss || 0, tot = hit + miss;
       var pct = tot ? (hit / tot * 100) : 0;
       n('hitpct', pct.toFixed(2) + '%');
-      n('hitraw', 'hit ' + hit + ' / miss ' + miss + ' (Redis page cache, post-edge)');
+      n('hitraw', 'hit ' + hit + ' / miss ' + miss + ' (Redis cache-aside)');
       document.getElementById('hitbar').style.width = pct.toFixed(1) + '%';
 
       var acc = m.orders_accepted || 0, sold = m.orders_soldout || 0, dup = m.orders_duplicate || 0;
@@ -116,7 +115,6 @@ export const DASHBOARD_HTML = `<!doctype html>
           }).join('')
         : '<div class="sub">no cache:stock:* keys</div>';
 
-      document.getElementById('ver').textContent = 'cache:ver ' + (d.version || '0');
       elDot.className = 'dot';
       elStatus.textContent = 'live · ' + new Date().toLocaleTimeString();
     } catch (e) {

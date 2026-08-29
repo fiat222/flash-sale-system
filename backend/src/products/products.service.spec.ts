@@ -12,11 +12,8 @@ describe('ProductsService', () => {
     get: jest.Mock;
     set: jest.Mock;
     mget: jest.Mock;
-    incr: jest.Mock;
-    smembers: jest.Mock;
-    sadd: jest.Mock;
+    scan: jest.Mock;
     del: jest.Mock;
-    pipeline: jest.Mock;
   };
   let repo: { findAndCount: jest.Mock };
 
@@ -29,22 +26,8 @@ describe('ProductsService', () => {
         return Promise.resolve('OK');
       }),
       mget: jest.fn(),
-      incr: jest.fn().mockResolvedValue(1),
-      smembers: jest.fn().mockResolvedValue([]),
-      sadd: jest.fn(),
-      del: jest.fn().mockResolvedValue(1),
-      // pipeline().set().sadd().exec() — writes straight through to the store
-      pipeline: jest.fn(() => {
-        const p: Record<string, (...a: unknown[]) => unknown> = {
-          set: (k: string, v: string) => {
-            store.set(k, v);
-            return p;
-          },
-          sadd: () => p,
-          exec: () => Promise.resolve([]),
-        };
-        return p;
-      }),
+      scan: jest.fn(),
+      del: jest.fn(),
     };
     repo = { findAndCount: jest.fn() };
 
@@ -60,7 +43,7 @@ describe('ProductsService', () => {
     service = module.get(ProductsService);
   });
 
-  it('builds from Postgres on cold cache, then splices remainingStock live from Redis', async () => {
+  it('builds from Postgres on a cache miss and splices live remainingStock from Redis', async () => {
     repo.findAndCount.mockResolvedValue([
       [
         {
@@ -68,6 +51,7 @@ describe('ProductsService', () => {
           name: 'Limited Edition Sneaker',
           price: '2990.00',
           availableStock: 50,
+          remainingStock: 50,
           isFlashSaleActive: true,
         },
       ],
@@ -75,34 +59,52 @@ describe('ProductsService', () => {
     ]);
     redis.mget.mockResolvedValue(['30']);
 
-    const body = JSON.parse(await service.getPage(1, 10));
+    const body = await service.getPage(1, 10);
 
     expect(repo.findAndCount).toHaveBeenCalledTimes(1);
     expect(redis.mget).toHaveBeenCalledWith(['cache:stock:p-1001']);
     expect(body.data[0].remainingStock).toBe(30);
     expect(body.meta).toEqual({ total: 1, page: 1, limit: 10, totalPages: 1 });
+    // cached (serialised) under the page key with a TTL
+    expect(redis.set).toHaveBeenCalledWith(
+      'cache:products:page:1:limit:10',
+      expect.any(String),
+      'EX',
+      60,
+    );
   });
 
-  it('serves a warm page from one Redis GET — no Postgres, no MGET', async () => {
+  it('serves a warm page from one Redis GET — no Postgres', async () => {
     repo.findAndCount.mockResolvedValue([[], 0]);
     redis.mget.mockResolvedValue([]);
 
-    await service.getPage(2, 10); // cold: build + store cache:page:2:10
-    redis.mget.mockClear();
-    await service.getPage(2, 10); // warm: single GET hit
+    await service.getPage(2, 10); // cold: build + cache
+    repo.findAndCount.mockClear();
+    await service.getPage(2, 10); // warm: GET hit
 
-    expect(repo.findAndCount).toHaveBeenCalledTimes(1);
-    expect(redis.mget).not.toHaveBeenCalled();
+    expect(repo.findAndCount).not.toHaveBeenCalled();
   });
 
-  it('invalidate() drops every known page cache then bumps the version key', async () => {
-    redis.smembers.mockResolvedValue(['1:10', '2:10']);
-    store.set('cache:page:1:10', 'stale');
-    store.set('cache:page:2:10', 'stale');
+  it('single-flights a stampede of concurrent misses onto one Postgres build', async () => {
+    let resolveDb!: (v: [unknown[], number]) => void;
+    repo.findAndCount.mockReturnValue(new Promise((r) => (resolveDb = r)));
+    redis.mget.mockResolvedValue([]);
+
+    const calls = [service.getPage(3, 10), service.getPage(3, 10), service.getPage(3, 10)];
+    resolveDb([[], 0]);
+    await Promise.all(calls);
+
+    expect(repo.findAndCount).toHaveBeenCalledTimes(1); // not 3
+  });
+
+  it('invalidate() SCANs and deletes every cached product page', async () => {
+    redis.scan
+      .mockResolvedValueOnce(['7', ['cache:products:page:1:limit:10']])
+      .mockResolvedValueOnce(['0', ['cache:products:page:2:limit:10']]);
 
     await service.invalidate();
 
-    expect(redis.del).toHaveBeenCalledWith('cache:page:1:10', 'cache:page:2:10');
-    expect(redis.incr).toHaveBeenCalledWith('cache:ver');
+    expect(redis.del).toHaveBeenCalledWith('cache:products:page:1:limit:10');
+    expect(redis.del).toHaveBeenCalledWith('cache:products:page:2:limit:10');
   });
 });

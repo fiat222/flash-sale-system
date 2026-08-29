@@ -24,27 +24,26 @@ x-api-common: &api-common
     resources:
       limits:
         # 6 small instances (Node is single-threaded — scale OUT). VM is 4 vCPU /
-        # 6 GiB. The nginx edge cache serves 100% of the read plateau so the api
-        # tier is idle during reads — but the 500-concurrent POST /orders burst
-        # still lands fully on it (JWT verify + Redis claim + queue.add). Cutting
-        # api to 0.35 pushed write p95 716 -> 1092ms, so it goes back to 0.50.
-        #   6*0.50 + nginx 0.90 + redis 0.55 + pg 0.35 + worker 0.35 = 5.15
-        # ceilings; read and write peaks don't overlap (k6 writes start at 33s).
-        cpus: "0.50"
+        # 6 GiB. With the nginx edge cache removed, EVERY read request hits Node
+        # again (cache-aside — 1 Redis GET), plus the 500-way POST /orders burst.
+        # api is the bottleneck for both, so it gets the biggest slice:
+        #   6*0.60 + nginx 0.45 + redis 0.60 + pg 0.25 + worker 0.35 = 5.25
+        # ceilings (read/write peaks don't overlap — k6 writes start at 33s).
+        # RE-CHECK with loadcap after the first run: on a 4-core box this is at
+        # the edge, expect the top throttler to be api or redis.
+        cpus: "0.60"
         memory: 424M
 
 services:
   nginx:
-    # openresty = nginx + lua + lua-resty-redis (nginx.conf reads cache:ver
-    # from Redis per request to version the edge cache key).
-    image: openresty/openresty:alpine
+    # Plain reverse proxy / load balancer (edge cache removed — see nginx.conf).
+    image: nginx:alpine
     ports:
       - "${NGINX_PORT}:80"
     volumes:
-      - ./nginx.conf:/usr/local/openresty/nginx/conf/nginx.conf:ro
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
     tmpfs:
-      - /var/cache/nginx:size=96m,mode=1777   # cache bodies in RAM
-      - /var/log/nginx:size=16m,mode=1777     # slow.log
+      - /var/log/nginx:size=16m     # slow.log
     depends_on:
       - api1
       - api2
@@ -56,12 +55,10 @@ services:
     deploy:
       resources:
         limits:
-          # Serves the ENTIRE read plateau from tmpfs (3 workers). Version key is
-          # memoised in a lua_shared_dict (1s TTL) so there is no per-request
-          # Redis round trip. At 0.90 it was the only container still throttling
-          # (~9.4s / 45s) while the box sat ~78% idle — bumped to 1.80.
-          cpus: "1.80"
-          memory: 224M
+          # Pure proxy now (no cache work) — historically ~0.5 core at the
+          # 1,000-VU read peak. 0.45; the freed core goes to api/redis.
+          cpus: "0.45"
+          memory: 128M
 
   api1:
     <<: *api-common
@@ -122,9 +119,9 @@ services:
     deploy:
       resources:
         limits:
-          # Drains ~50 jobs (concurrency 15) per write burst: DB txn + DEL page
-          # cache + INCR cache:ver each. Affects queue backlog, not the POST
-          # latency. 0.35 keeps the drain up with the burst.
+          # Drains ~50 jobs (concurrency 15) per write burst: one locked DB txn +
+          # a product-page cache invalidation each. Affects queue backlog, not
+          # POST latency.
           cpus: "0.35"
           memory: 384M
 
@@ -168,11 +165,12 @@ services:
     deploy:
       resources:
         limits:
-          # Read path never touches postgres (served from the edge cache); write
-          # path does ~50 short pessimistic-locked txns in a tight burst.
+          # Read path only hits postgres on a cold cache-aside miss (single-
+          # flighted to one build per page); write path does ~50 short
+          # pessimistic-locked txns in a tight burst.
           # max_connections=120 covers the pool worst case:
           # 6 api * POSTGRES_POOL_API(8) + worker * POSTGRES_POOL_WORKER(20) = 68.
-          cpus: "0.35"
+          cpus: "0.25"
           memory: 512M
 
   redis:
@@ -189,10 +187,10 @@ services:
     deploy:
       resources:
         limits:
-          # Hot paths: (1) page-cache GET on an edge miss (rare — ~1/version),
-          # (2) lua cache:ver refill ~1/s/worker, (3) the Lua claim + BullMQ
-          # enqueue for all 500 concurrent writes. (3) dominates: 0.55.
-          cpus: "0.55"
+          # Hot paths: (1) one cache-aside GET per read request (~5-6k GET/s at
+          # the read peak — up now that the edge cache is gone), (2) the Lua
+          # claim + BullMQ enqueue for all 500 concurrent writes. 0.60.
+          cpus: "0.60"
           memory: 512M
 
 volumes:

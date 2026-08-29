@@ -120,7 +120,7 @@ export default function (data) {
 // Report requirements #1 (Cache) and #2 (Queue): dump the API counters and
 // point at the manual sources so the run is self-documenting.
 export function teardown() {
-  sleep(2); // MetricsService flushes in-memory counters to Redis once a second
+  sleep(1); // let the last fire-and-forget metric INCRs land in Redis
   const res = http.get(`${BASE_URL}/api/v1/_metrics`, { timeout: REQ_TIMEOUT });
   let m = {};
   try {

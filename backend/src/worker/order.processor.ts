@@ -55,7 +55,7 @@ export class OrderProcessor extends WorkerHost {
       throw err;
     }
 
-    await this.productsService.invalidateTemplates();
+    await this.productsService.invalidate();
   }
 
   // Compensation: only for jobs that exhausted retries on a transient failure.

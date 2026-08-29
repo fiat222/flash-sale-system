@@ -88,7 +88,7 @@ export default function () {
 // Report requirement #1 (Cache Performance): print the L1/L2/miss counters and
 // the derived hit ratio straight from the API so the run is self-documenting.
 export function teardown() {
-  sleep(2); // MetricsService flushes in-memory counters to Redis once a second
+  sleep(1); // let the last fire-and-forget metric INCRs land in Redis
   const res = http.get(`${BASE_URL}/api/v1/_metrics`, PARAMS);
   let m = {};
   try {

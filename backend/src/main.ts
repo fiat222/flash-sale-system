@@ -1,7 +1,7 @@
 import 'reflect-metadata';
 import { NestFactory } from '@nestjs/core';
 import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify';
-import { Logger } from '@nestjs/common';
+import { Logger, ValidationPipe } from '@nestjs/common';
 import { getQueueToken } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { AppModule } from './app.module';
@@ -28,9 +28,9 @@ async function bootstrapHttp(): Promise<void> {
     new FastifyAdapter({ logger: false, disableRequestLogging: true }),
   );
 
-  // ValidationPipe is NOT global — it is applied only where a DTO exists
-  // (OrdersController). Keeping it off GET /api/v1/products, the read hot path,
-  // removes a per-request pipe pass from the endpoint the load test hammers.
+  app.useGlobalPipes(
+    new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }),
+  );
 
   if (role === 'worker') {
     const queue = app.get<Queue>(getQueueToken('orders'));
