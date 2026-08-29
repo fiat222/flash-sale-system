@@ -26,12 +26,12 @@ x-api-common: &api-common
         # 6 small instances (Node is single-threaded — scale OUT). VM is 4 vCPU /
         # 6 GiB. With the nginx edge cache removed, EVERY read request hits Node
         # again (cache-aside — 1 Redis GET), plus the 500-way POST /orders burst.
-        # api is the bottleneck for both, so it gets the biggest slice:
-        #   6*0.60 + nginx 0.45 + redis 0.60 + pg 0.25 + worker 0.35 = 5.25
+        # Measured at 0.50: api throttled ~10-13s / 45s during the write burst
+        # (VM pegged, loadavg 4.6) while nginx (+0.0s) and redis (+0.2s) had
+        # slack — so slack moves here.
+        #   6*0.55 + nginx 0.85 + redis 0.35 + pg 0.25 + worker 0.35 = 5.10
         # ceilings (read/write peaks don't overlap — k6 writes start at 33s).
-        # RE-CHECK with loadcap after the first run: on a 4-core box this is at
-        # the edge, expect the top throttler to be api or redis.
-        cpus: "0.60"
+        cpus: "0.55"
         memory: 424M
 
 services:
@@ -55,9 +55,11 @@ services:
     deploy:
       resources:
         limits:
-          # Pure proxy now (no cache work) — historically ~0.5 core at the
-          # 1,000-VU read peak. 0.45; the freed core goes to api/redis.
-          cpus: "0.45"
+          # Pure proxy, but it proxies EVERY read (~2.7k rps) to Node now — no
+          # cache to absorb them. At 0.45 it throttled ~29s / 45s and was the
+          # read-latency bottleneck. 2 workers (see nginx.conf) fixed it: +0.0s
+          # throttle at 1.10, so trimmed to 0.85 and the slice went to api.
+          cpus: "0.85"
           memory: 128M
 
   api1:
@@ -187,10 +189,11 @@ services:
     deploy:
       resources:
         limits:
-          # Hot paths: (1) one cache-aside GET per read request (~5-6k GET/s at
-          # the read peak — up now that the edge cache is gone), (2) the Lua
-          # claim + BullMQ enqueue for all 500 concurrent writes. 0.60.
-          cpus: "0.60"
+          # Hot paths: (1) one cache-aside GET per read request (~2.7k GET/s at
+          # the read peak), (2) the Lua claim + BullMQ enqueue for all 500
+          # concurrent writes. Measured +0.2s throttle at 0.45 — big slack,
+          # trimmed to 0.35 and the slice went to api.
+          cpus: "0.35"
           memory: 512M
 
 volumes:
