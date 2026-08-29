@@ -22,9 +22,6 @@ COPY package*.json ./
 RUN npm ci --omit=dev
 COPY --from=builder /app/dist ./dist
 COPY data ./data
-# Empty named volume mounted here inherits this ownership on first init, so the
-# api (USER node) can bind its unix socket and nginx can read it.
-RUN mkdir -p /sock && chown node:node /sock
 USER node
 EXPOSE 3000
 CMD ["node", "dist/main.js"]

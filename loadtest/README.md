@@ -8,7 +8,7 @@ node loadtest/reset.js               # reset DB + Redis state (stack must alread
 k6 run -e BASE_URL=http://localhost loadtest/read.js
 k6 run -e BASE_URL=http://localhost loadtest/write.js
 k6 run -e BASE_URL=http://localhost loadtest/flash-sale.js
-docker run --rm  -v ${PWD}/loadtest:/loadtest -p 5665:5665 -e K6_WEB_DASHBOARD=true -e K6_WEB_DASHBOARD_EXPORT=/loadtest/report.html grafana/k6 run -e BASE_URL=http://172.30.58.10:8081 /loadtest/read.js
+docker run --rm  -v ${PWD}/loadtest:/loadtest -p 5665:5665 -e K6_WEB_DASHBOARD=true -e K6_WEB_DASHBOARD_EXPORT=/loadtest/report.html grafana/k6 run -e BASE_URL=http://172.30.58.10:8081 /loadtest/flash-sale.js
 # รันแบบมี dashboard
 ```
 

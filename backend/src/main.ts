@@ -1,5 +1,4 @@
 import 'reflect-metadata';
-import { unlinkSync, chmodSync } from 'fs';
 import { NestFactory } from '@nestjs/core';
 import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify';
 import { Logger } from '@nestjs/common';
@@ -39,28 +38,6 @@ async function bootstrapHttp(): Promise<void> {
     const port = Number(process.env.WORKER_PORT ?? 3001);
     await app.listen(port, '0.0.0.0');
     logger.log(`Worker up — Bull-Board on :${port}/admin/queues`);
-    return;
-  }
-
-  // nginx <-> api over a unix domain socket when API_SOCKET is set (prod
-  // compose): removes the loopback-TCP syscall/softirq cost that showed up as
-  // ~30% system CPU under the 1,000-VU read load. Falls back to TCP for dev.
-  const socketPath = process.env.API_SOCKET;
-  if (socketPath) {
-    await app.init();
-    const fastify = app.getHttpAdapter().getInstance();
-    try {
-      unlinkSync(socketPath);
-    } catch {
-      /* no stale socket */
-    }
-    await fastify.listen({ path: socketPath });
-    try {
-      chmodSync(socketPath, 0o777); // nginx runs as a different user
-    } catch {
-      /* best effort */
-    }
-    logger.log(`API up on ${socketPath}`);
     return;
   }
 
