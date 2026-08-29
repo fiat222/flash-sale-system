@@ -28,9 +28,13 @@ async function bootstrapHttp(): Promise<void> {
     new FastifyAdapter({ logger: false, disableRequestLogging: true }),
   );
 
-  app.useGlobalPipes(
-    new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }),
-  );
+  const validationPipe = new ValidationPipe({
+    whitelist: true,
+    forbidNonWhitelisted: true,
+    transform: true,
+  });
+
+  app.useGlobalPipes(validationPipe);
 
   if (role === 'worker') {
     const queue = app.get<Queue>(getQueueToken('orders'));

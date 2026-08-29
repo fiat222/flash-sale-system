@@ -62,8 +62,8 @@ export class OrdersService {
         jobId: `${userId}|${productId}`,
         // Keep the last N terminal jobs so Bull-Board can show real
         // Completed / Failed counts for the report (spec 3, Queue Monitoring).
-        removeOnComplete: { count: 1000 },
-        removeOnFail: { count: 1000 },
+        removeOnComplete: { count: 100 },
+        removeOnFail: { count: 100 },
         attempts: 3,
         backoff: { type: 'exponential', delay: 200 },
       },

@@ -24,7 +24,7 @@ export class JwtGuard implements CanActivate {
 
     try {
       const secret = this.config.get<string>('JWT_SECRET', 'changeme');
-      const payload = jwt.verify(token, secret) as jwt.JwtPayload;
+      const payload = jwt.verify(token, secret, { algorithms: ['HS256'] }) as jwt.JwtPayload;
       (request as FastifyRequest & { userId: string }).userId = payload.sub as string;
       return true;
     } catch {
