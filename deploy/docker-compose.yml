@@ -4,7 +4,7 @@ x-api-common: &api-common
   # CI publishes this on push (.github/workflows/publish-image.yml). On the VM
   # `docker compose pull` fetches it; `build:` is still here so a local
   # `docker compose up --build` keeps working without the registry.
-  image: ${BACKEND_IMAGE:-ghcr.io/fiat222/flash-sale-backend:sha-6feb9c5}
+  image: ${BACKEND_IMAGE:-ghcr.io/fiat222/flash-sale-backend:latest}
   build:
     context: ../backend
     dockerfile: Dockerfile
