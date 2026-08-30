@@ -9,7 +9,13 @@ import { MetricsService } from '../metrics/metrics.service';
 
 const PAGE_KEY = (page: number, limit: number) => `cache:products:page:${page}:limit:${limit}`;
 const PAGE_KEY_GLOB = 'cache:products:page:*';
-const PAGE_TTL_SECONDS = 60;
+// TTL with jitter (anti-avalanche). Every page key is first built inside the
+// same ~1s cold window, so a fixed TTL makes them all expire in lockstep — one
+// synchronised wave of misses. Spreading expiry over a 20s band breaks the wave;
+// the L2 lock then only ever has one key rebuilding at a time.
+const PAGE_TTL_BASE_SECONDS = 60;
+const PAGE_TTL_JITTER_SECONDS = 20;
+const pageTtl = () => PAGE_TTL_BASE_SECONDS + Math.floor(Math.random() * PAGE_TTL_JITTER_SECONDS);
 
 // Cross-instance single-flight (L2). Nginx round-robins cold reads across every
 // api instance, so an in-process Map alone still lets one Postgres build run per
@@ -111,7 +117,7 @@ export class ProductsService {
   private async buildAndCache(page: number, limit: number, key: string): Promise<ProductPage> {
     this.metrics.increment('db_build'); // true Postgres rebuilds (<< cache_miss thanks to L1 + L2 single-flight)
     const body = await this.buildPage(page, limit);
-    await this.redis.set(key, JSON.stringify(body), 'EX', PAGE_TTL_SECONDS);
+    await this.redis.set(key, JSON.stringify(body), 'EX', pageTtl());
     return body;
   }
 

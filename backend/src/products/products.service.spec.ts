@@ -72,13 +72,13 @@ describe('ProductsService', () => {
     expect(redis.mget).toHaveBeenCalledWith(['cache:stock:p-1001']);
     expect(body.data[0].remainingStock).toBe(30);
     expect(body.meta).toEqual({ total: 1, page: 1, limit: 10, totalPages: 1 });
-    // cached (serialised) under the page key with a TTL
-    expect(redis.set).toHaveBeenCalledWith(
-      'cache:products:page:1:limit:10',
-      expect.any(String),
-      'EX',
-      60,
-    );
+    // cached (serialised) under the page key with a jittered TTL (60-79s)
+    const pageSet = redis.set.mock.calls.find((c) => c[0] === 'cache:products:page:1:limit:10');
+    expect(pageSet).toBeDefined();
+    expect(pageSet![1]).toEqual(expect.any(String));
+    expect(pageSet![2]).toBe('EX');
+    expect(pageSet![3]).toBeGreaterThanOrEqual(60);
+    expect(pageSet![3]).toBeLessThan(80);
   });
 
   it('serves a warm page from one Redis GET — no Postgres', async () => {
