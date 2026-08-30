@@ -62,6 +62,7 @@ const ordersSoldout = new Counter('orders_soldout'); // HTTP 409 "Product sold o
 const ordersDuplicate = new Counter('orders_duplicate'); // HTTP 409 already-claimed
 const readCacheHitPct = new Trend('read_cache_hit_pct'); // sampled during read phase
 const writeQueueBacklog = new Trend('write_queue_backlog'); // waiting+active, sampled during write
+const dataIntegrityOk = new Rate('data_integrity_ok'); // post-burst remainingStock == 0
 
 const REQ = { timeout: REQ_TIMEOUT };
 const JSON_HDR = { 'Content-Type': 'application/json' };
@@ -103,6 +104,7 @@ export const options = {
     infra_failures: ['rate<0.01'],
     'checks{scenario:read_load}': ['rate>0.99'],
     'checks{scenario:write_load}': ['rate>0.99'],
+    data_integrity_ok: ['rate>0.99'], // remainingStock must be 0 after the drain
   },
   summaryTrendStats: ['avg', 'med', 'p(90)', 'p(95)', 'p(99)', 'max'],
 };
@@ -198,21 +200,28 @@ function tallyOrder(res) {
 // ============================ samplers ====================================
 function sampleCache(phase) {
   const m = fetchMetrics();
-  if (!m) return;
-  const l1 = m.metrics.cache_l1_hit || 0;
-  const l2 = m.metrics.cache_l2_hit || 0;
-  const miss = m.metrics.cache_miss || 0;
-  const total = l1 + l2 + miss;
+  const mm = m && m.metrics;
+  if (!mm) return; // other groups may expose no /_metrics, or a different shape
+  const hit = mm.cache_hit || 0; // origin (Redis page cache) hit
+  const miss = mm.cache_miss || 0; // Postgres rebuild
+  const total = hit + miss;
   if (!total) return;
-  const hitPct = ((l1 + l2) / total) * 100;
+  const hitPct = (hit / total) * 100;
   readCacheHitPct.add(hitPct);
-  console.log(`[${phase}] cache hit ${hitPct.toFixed(2)}%  (L1 ${l1} / L2 ${l2} / miss ${miss})`);
+  console.log(`[${phase}] cache hit ${hitPct.toFixed(2)}%  (hit ${hit} / miss ${miss})`);
 }
 
 function fetchMetrics() {
-  const res = http.get(`${BASE_URL}/api/v1/_metrics`, REQ);
+  let res;
   try {
-    return res.json();
+    res = http.get(`${BASE_URL}/api/v1/_metrics`, REQ);
+  } catch (e) {
+    return null;
+  }
+  if (!res || res.status !== 200) return null;
+  try {
+    const j = res.json();
+    return j && typeof j === 'object' ? j : null;
   } catch (e) {
     return null;
   }
@@ -234,25 +243,44 @@ export function teardown() {
   }
   writeQueueBacklog.add(peakBacklog);
 
+  // Data Integrity Proof (spec §3.4): once the queue is drained, the read API
+  // must report remainingStock === 0 for the contended product — proves the
+  // Redis cache was invalidated correctly and never served a stale count.
+  let integrityLine = '  remainingStock after drain : (not checked)';
+  {
+    const res = http.get(`${BASE_URL}/api/v1/products?page=1&limit=10`, REQ);
+    let rs = null;
+    try {
+      const j = res.json();
+      const row = (j.data || []).find((p) => p.productId === PRODUCT_ID);
+      rs = row ? row.remainingStock : null;
+    } catch (e) {
+      /* rs stays null */
+    }
+    const ok = rs === 0 || rs === '0';
+    dataIntegrityOk.add(ok);
+    check(null, { 'integrity: remainingStock == 0 after drain': () => ok });
+    integrityLine = `  remainingStock after drain : ${rs}  (${ok ? 'OK' : 'STALE / WRONG'})`;
+  }
+
   if (!m) {
     console.log('teardown: could not read /api/v1/_metrics');
+    console.log(integrityLine);
     return;
   }
   const c = m.metrics || {};
   const q = m.queue || {};
-  const l1 = c.cache_l1_hit || 0;
-  const l2 = c.cache_l2_hit || 0;
+  const hit = c.cache_hit || 0;
   const miss = c.cache_miss || 0;
-  const tot = l1 + l2 + miss || 1;
+  const tot = hit + miss || 1;
   const pct = (n) => ((n / tot) * 100).toFixed(2);
 
   const lines = [
     '',
     '================  CACHE CHECK (GET /api/v1/_metrics)  ================',
-    `  L1 hit : ${l1}  (${pct(l1)}%)`,
-    `  L2 hit : ${l2}  (${pct(l2)}%)`,
-    `  miss   : ${miss}  (${pct(miss)}%)`,
-    `  HIT / MISS ratio : ${pct(l1 + l2)}%  /  ${pct(miss)}%`,
+    `  Redis hit             : ${hit}  (${pct(hit)}%)`,
+    `  miss (Postgres build) : ${miss}  (${pct(miss)}%)`,
+    `  HIT / MISS ratio      : ${pct(hit)}%  /  ${pct(miss)}%`,
     '',
     '================  QUEUE CHECK  ======================================',
     `  waiting=${q.waiting ?? '?'}  active=${q.active ?? '?'}  delayed=${q.delayed ?? '?'}`,
@@ -264,6 +292,9 @@ export function teardown() {
     `  accepted (202)  : ${c.orders_accepted || 0}`,
     `  sold out (409)  : ${c.orders_soldout || 0}`,
     `  duplicate (409) : ${c.orders_duplicate || 0}`,
+    '',
+    '================  DATA INTEGRITY  ===================================',
+    integrityLine,
     '====================================================================',
     '',
   ];
@@ -305,7 +336,7 @@ export function handleSummary(data) {
     `    requests ......... ${g('http_reqs', 'count')}   (${f2(g('http_reqs', 'rate'))}/s overall)`,
     `    p95 latency ...... ${f2(g(rd, 'p(95)'))} ms   (p99 ${f2(g(rd, 'p(99)'))} ms, max ${f2(g(rd, 'max'))} ms)`,
     `    checks .......... ${f2(g('checks{scenario:read_load}', 'rate') * 100)}% pass`,
-    `    cache hit (sampled) ${f2(g('read_cache_hit_pct', 'avg'))}% avg`,
+    `    cache hit ........ ${f2(g('read_cache_hit_pct', 'avg'))}% avg (Redis cache-aside, sampled)`,
     '',
     '  WRITE PHASE',
     `    orders accepted .. ${g('orders_accepted', 'count')}   (expect 50)`,
@@ -317,6 +348,7 @@ export function handleSummary(data) {
     '',
     '  OVERALL',
     `    infra failure rate ${f2(g('infra_failures', 'rate') * 100)}%   (5xx / timeout / non-409 4xx)`,
+    `    data integrity ... ${g('data_integrity_ok', 'rate') === 1 ? 'PASS (remainingStock == 0 after drain)' : 'FAIL — stale count served'}`,
     `    total requests ... ${g('http_reqs', 'count')}`,
     '',
     '##################################################################',

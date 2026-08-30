@@ -22,6 +22,9 @@ x-dev-common: &dev-common
     # Base file caps V8 heap at 220MB for the compiled prod process — tsc's
     # own watch-mode compilation needs more headroom than that to not OOM.
     NODE_OPTIONS: ""
+    # .env sets NODE_ENV=production for the prod image; dev needs it unset
+    # so Nest picks up dev-only behavior (e.g. detailed error responses).
+    NODE_ENV: development
   # ts compilation under --watch is heavier than the compiled prod process —
   # the production budget from the architecture doc is too tight for it.
   deploy:

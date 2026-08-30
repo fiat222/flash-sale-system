@@ -60,12 +60,11 @@ function main() {
     compose('exec', '-T', 'redis', 'redis-cli', 'DEL', `cache:claim:${p.productId}`);
   }
 
-  console.log('Clearing template + metrics cache so hit ratios start clean...');
-  const templateKeys = scanKeys('cache:template:*');
-  if (templateKeys.length) compose('exec', '-T', 'redis', 'redis-cli', 'DEL', ...templateKeys);
-
-  const metricKeys = scanKeys('cache:m:*');
-  if (metricKeys.length) compose('exec', '-T', 'redis', 'redis-cli', 'DEL', ...metricKeys);
+  console.log('Clearing product page cache + metrics counters so ratios start clean...');
+  const cacheKeys = [...scanKeys('cache:products:page:*'), ...scanKeys('cache:m:*')];
+  for (let i = 0; i < cacheKeys.length; i += 400) {
+    compose('exec', '-T', 'redis', 'redis-cli', 'DEL', ...cacheKeys.slice(i, i + 400));
+  }
 
   // Obliterate the BullMQ queue. removeOnComplete keeps the last 1,000 finished
   // jobs, whose deterministic jobIds (`user-N|p-1001`) would otherwise dedup

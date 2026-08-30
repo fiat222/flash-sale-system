@@ -8,6 +8,7 @@ API
 - order product
 รับ concurrent connection จำนวนมาก ห้ามให้มีการจองเกินจำนวน
 
+ห้ามใช้ in-memory-caching
 
 API Endpoint
 ต้องเขียน K6 Loadtest สำหรับตัวเอง และระหว่างกลุ่มได้

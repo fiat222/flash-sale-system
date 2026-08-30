@@ -6,16 +6,30 @@ import { Product } from '../database/entities/product.entity';
 import { REDIS_CLIENT } from '../redis/redis.provider';
 import { MetricsService } from '../metrics/metrics.service';
 
-interface PageTemplate {
-  segments: string[];
-  ids: string[];
+const PAGE_KEY = (page: number, limit: number) => `cache:products:page:${page}:limit:${limit}`;
+const PAGE_KEY_GLOB = 'cache:products:page:*';
+const PAGE_TTL_SECONDS = 60;
+
+export interface ProductListItem {
+  productId: string;
+  name: string;
+  price: number;
+  availableStock: number;
+  remainingStock: number;
+  isFlashSaleActive: boolean;
+}
+
+export interface ProductPage {
+  status: 'success';
+  data: ProductListItem[];
+  meta: { total: number; page: number; limit: number; totalPages: number };
 }
 
 @Injectable()
 export class ProductsService {
-  // segments/ids never change during a flash sale (product catalog is static) —
-  // safe to hold per-instance without any invalidation for L1.
-  private readonly l1 = new Map<string, PageTemplate>();
+  // Single-flight (lab 4): in-flight Postgres builds keyed by page key. Holds
+  // only unsettled promises (deleted in .finally) — not a result cache.
+  private readonly inflight = new Map<string, Promise<ProductPage>>();
 
   constructor(
     @InjectRepository(Product) private readonly productRepo: Repository<Product>,
@@ -23,81 +37,72 @@ export class ProductsService {
     private readonly metrics: MetricsService,
   ) {}
 
-  async getPage(page: number, limit: number): Promise<string> {
-    const key = `${page}:${limit}`;
-    let tpl = this.l1.get(key);
-    if (tpl) {
-      this.metrics.increment('cache_l1_hit');
-    } else {
-      const fromL2 = await this.loadFromL2(key);
-      this.metrics.increment(fromL2 ? 'cache_l2_hit' : 'cache_miss');
-      tpl = fromL2 ?? (await this.buildTemplate(page, limit, key));
-      this.l1.set(key, tpl);
+  // Cache-aside (lab 4): check Redis; on a miss build the page from Postgres +
+  // live stock, cache the serialised payload with a TTL, and return it.
+  async getPage(page: number, limit: number): Promise<ProductPage> {
+    const key = PAGE_KEY(page, limit);
+    const cached = await this.redis.get(key);
+    if (cached !== null) {
+      this.metrics.increment('cache_hit');
+      return JSON.parse(cached) as ProductPage;
     }
+    this.metrics.increment('cache_miss');
 
-    if (tpl.ids.length === 0) return tpl.segments[0];
+    // Coalesce a stampede of concurrent requests for the same uncached page
+    // onto ONE Postgres build instead of N (lab 4 cache-stampede fix).
+    const pending = this.inflight.get(key);
+    if (pending) return pending;
 
-    const stocks = await this.redis.mget(tpl.ids.map((id) => `cache:stock:${id}`));
-    let out = tpl.segments[0];
-    for (let i = 0; i < stocks.length; i++) {
-      out += (stocks[i] ?? '0') + tpl.segments[i + 1];
-    }
-    return out;
+    const build = this.buildAndCache(page, limit, key).finally(() => this.inflight.delete(key));
+    this.inflight.set(key, build);
+    return build;
   }
 
-  // Called by the worker after a committed stock deduction, per the documented
-  // cache-invalidation strategy (product fields other than remainingStock —
-  // which is never cached — are cheap to fully re-derive on next request).
-  async invalidateTemplates(): Promise<void> {
-    this.l1.clear();
+  private async buildAndCache(page: number, limit: number, key: string): Promise<ProductPage> {
+    this.metrics.increment('db_build'); // actual Postgres rebuilds (< cache_miss thanks to single-flight)
+    const body = await this.buildPage(page, limit);
+    await this.redis.set(key, JSON.stringify(body), 'EX', PAGE_TTL_SECONDS);
+    return body;
+  }
+
+  // Invalidate-after-write (lab 4): the worker calls this AFTER a committed
+  // stock deduction. Drop every cached product page so the next read rebuilds
+  // with the current remainingStock.
+  async invalidate(): Promise<void> {
     let cursor = '0';
     do {
-      const [next, keys] = await this.redis.scan(cursor, 'MATCH', 'cache:template:*', 'COUNT', 100);
+      const [next, keys] = await this.redis.scan(cursor, 'MATCH', PAGE_KEY_GLOB, 'COUNT', 100);
       cursor = next;
       if (keys.length) await this.redis.del(...keys);
     } while (cursor !== '0');
   }
 
-  private async loadFromL2(key: string): Promise<PageTemplate | null> {
-    const raw = await this.redis.get(`cache:template:${key}`);
-    return raw ? (JSON.parse(raw) as PageTemplate) : null;
-  }
-
-  private async buildTemplate(page: number, limit: number, key: string): Promise<PageTemplate> {
+  private async buildPage(page: number, limit: number): Promise<ProductPage> {
     const [rows, total] = await this.productRepo.findAndCount({
       order: { productId: 'ASC' },
       skip: (page - 1) * limit,
       take: limit,
     });
-    const totalPages = Math.ceil(total / limit);
 
-    const body = {
+    // remainingStock lives in Redis (`cache:stock:*`), decremented atomically by
+    // the order claim. Read it live so the list is right the moment a claim
+    // lands — the DB column only catches up once the worker commits. Fall back
+    // to the DB value if the counter is missing (cold cache).
+    const stocks = rows.length
+      ? await this.redis.mget(rows.map((r) => `cache:stock:${r.productId}`))
+      : [];
+
+    return {
       status: 'success',
       data: rows.map((r, i) => ({
         productId: r.productId,
         name: r.name,
         price: Number(r.price),
         availableStock: r.availableStock,
-        remainingStock: `@@RS${i}@@`,
+        remainingStock: stocks[i] != null ? Number(stocks[i]) : r.remainingStock,
         isFlashSaleActive: r.isFlashSaleActive,
       })),
-      meta: { total, page, limit, totalPages },
+      meta: { total, page, limit, totalPages: Math.ceil(total / limit) },
     };
-
-    const json = JSON.stringify(body);
-    const ids = rows.map((r) => r.productId);
-    const segments: string[] = [];
-    let rest = json;
-    for (let i = 0; i < ids.length; i++) {
-      const marker = `"@@RS${i}@@"`;
-      const idx = rest.indexOf(marker);
-      segments.push(rest.slice(0, idx));
-      rest = rest.slice(idx + marker.length);
-    }
-    segments.push(rest);
-
-    const tpl: PageTemplate = { segments, ids };
-    await this.redis.set(`cache:template:${key}`, JSON.stringify(tpl));
-    return tpl;
   }
 }

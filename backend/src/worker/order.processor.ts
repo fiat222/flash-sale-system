@@ -10,7 +10,7 @@ import { ProductsService } from '../products/products.service';
 import { MetricsService } from '../metrics/metrics.service';
 import { OrderJobData } from '../orders/orders.service';
 
-@Processor('orders', { concurrency: Number(process.env.WORKER_CONCURRENCY ?? 15) })
+@Processor('orders', { concurrency: Number(process.env.WORKER_CONCURRENCY ?? 30) })
 export class OrderProcessor extends WorkerHost {
   private readonly logger = new Logger(OrderProcessor.name);
 
@@ -55,7 +55,7 @@ export class OrderProcessor extends WorkerHost {
       throw err;
     }
 
-    await this.productsService.invalidateTemplates();
+    await this.productsService.invalidate();
   }
 
   // Compensation: only for jobs that exhausted retries on a transient failure.

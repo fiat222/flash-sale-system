@@ -23,36 +23,44 @@ x-api-common: &api-common
   deploy:
     resources:
       limits:
-        # api is the CPU bottleneck for BOTH phases (throttle counters: api ~80s
-        # vs redis ~0.4s). Node is single-threaded, so we scale OUT to 5 smaller
-        # instances instead of 3 bigger ones — 5 event loops absorb the 500-way
-        # concurrent write spike better at ~the same total budget (5*0.45=2.25).
-        cpus: "0.45"
-        memory: 350M
+        # 6 small instances (Node is single-threaded — scale OUT). VM is 4 vCPU /
+        # 6 GiB. With the nginx edge cache removed, EVERY read request hits Node
+        # again (cache-aside — 1 Redis GET), plus the 500-way POST /orders burst.
+        # Measured at 0.50: api throttled ~10-13s / 45s during the write burst
+        # (VM pegged, loadavg 4.6) while nginx (+0.0s) and redis (+0.2s) had
+        # slack — so slack moves here.
+        #   6*0.55 + nginx 0.85 + redis 0.35 + pg 0.25 + worker 0.35 = 5.10
+        # ceilings (read/write peaks don't overlap — k6 writes start at 33s).
+        cpus: "0.55"
+        memory: 424M
 
 services:
   nginx:
+    # Plain reverse proxy / load balancer (edge cache removed — see nginx.conf).
     image: nginx:alpine
     ports:
       - "${NGINX_PORT}:80"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    tmpfs:
+      - /var/log/nginx:size=16m     # slow.log
     depends_on:
       - api1
       - api2
       - api3
       - api4
       - api5
+      - api6
     restart: unless-stopped
     deploy:
       resources:
         limits:
-          # Single nginx worker (see nginx.conf). At 0.5 it was CFS-throttled
-          # ~99% at the 1,000-VU read peak (nr_throttled 3167). 0.85 clears the
-          # throttle with headroom (measured ~0.82 core at peak). Budget comes
-          # from postgres, which is fully idle on the read path (0.75->0.4).
+          # Pure proxy, but it proxies EVERY read (~2.7k rps) to Node now — no
+          # cache to absorb them. At 0.45 it throttled ~29s / 45s and was the
+          # read-latency bottleneck. 2 workers (see nginx.conf) fixed it: +0.0s
+          # throttle at 1.10, so trimmed to 0.85 and the slice went to api.
           cpus: "0.85"
-          memory: 64M
+          memory: 128M
 
   api1:
     <<: *api-common
@@ -84,6 +92,12 @@ services:
       ROLE: api
       NODE_OPTIONS: ${NODE_OPTIONS}
 
+  api6:
+    <<: *api-common
+    environment:
+      ROLE: api
+      NODE_OPTIONS: ${NODE_OPTIONS}
+
   worker:
     image: ${BACKEND_IMAGE:-ghcr.io/fiat222/flash-sale-backend:latest}
     build:
@@ -107,9 +121,11 @@ services:
     deploy:
       resources:
         limits:
-          # Drains ~50 jobs (concurrency 15) per write burst; 0.4 is ample.
-          cpus: "0.4"
-          memory: 300M
+          # Drains ~50 jobs (concurrency 15) per write burst: one locked DB txn +
+          # a product-page cache invalidation each. Affects queue backlog, not
+          # POST latency.
+          cpus: "0.35"
+          memory: 384M
 
   migrate:
     image: ${BACKEND_IMAGE:-ghcr.io/fiat222/flash-sale-backend:latest}
@@ -135,8 +151,9 @@ services:
     command: >
       postgres
       -c shared_buffers=192MB
-      -c max_connections=60
+      -c max_connections=120
       -c work_mem=4MB
+      -c synchronous_commit=off
     volumes:
       # postgres:18+ images store data under /var/lib/postgresql directly
       # (pg_ctlcluster-style layout) — mounting .../data breaks first boot.
@@ -150,10 +167,13 @@ services:
     deploy:
       resources:
         limits:
-          # Read path never touches postgres (served fully from L1/L2 cache);
-          # write path only does ~50 short locked txns. 0.35 is ample.
-          cpus: "0.35"
-          memory: 900M
+          # Read path only hits postgres on a cold cache-aside miss (single-
+          # flighted to one build per page); write path does ~50 short
+          # pessimistic-locked txns in a tight burst.
+          # max_connections=120 covers the pool worst case:
+          # 6 api * POSTGRES_POOL_API(8) + worker * POSTGRES_POOL_WORKER(20) = 68.
+          cpus: "0.25"
+          memory: 512M
 
   redis:
     image: redis:7-alpine
@@ -169,11 +189,12 @@ services:
     deploy:
       resources:
         limits:
-          # Measured: redis throttle is negligible (nr_throttled ~23,
-          # throttled_usec ~0.4s) even at 0.4 — it is NOT the write bottleneck.
-          # 0.45 keeps a small margin; the reclaimed budget goes to the api tier.
-          cpus: "0.45"
-          memory: 350M
+          # Hot paths: (1) one cache-aside GET per read request (~2.7k GET/s at
+          # the read peak), (2) the Lua claim + BullMQ enqueue for all 500
+          # concurrent writes. Measured +0.2s throttle at 0.45 — big slack,
+          # trimmed to 0.35 and the slice went to api.
+          cpus: "0.35"
+          memory: 512M
 
 volumes:
   postgres-data:

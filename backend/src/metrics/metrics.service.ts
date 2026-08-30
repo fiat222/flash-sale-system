@@ -1,37 +1,17 @@
-import { Inject, Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { Inject, Injectable } from '@nestjs/common';
 import Redis from 'ioredis';
 import { REDIS_CLIENT } from '../redis/redis.provider';
 
-const FLUSH_INTERVAL_MS = 1000;
-
 @Injectable()
-export class MetricsService implements OnModuleInit, OnModuleDestroy {
-  private counters: Record<string, number> = {};
-  private timer?: NodeJS.Timeout;
-
+export class MetricsService {
   constructor(@Inject(REDIS_CLIENT) private readonly redis: Redis) {}
 
-  onModuleInit(): void {
-    // Count in memory, flush to Redis once a second — avoids an extra Redis
-    // round trip on every single request just to bump a counter.
-    this.timer = setInterval(() => void this.flush(), FLUSH_INTERVAL_MS);
-  }
-
-  onModuleDestroy(): void {
-    clearInterval(this.timer);
-  }
-
+  // Atomic counter (lab 4): INCR is atomic on Redis' single-threaded loop, and
+  // the ioredis client auto-pipelines these so a burst of increments costs one
+  // round trip, not one per call. Fire-and-forget — a lost metric tick must
+  // never fail or slow a request.
   increment(key: string, by = 1): void {
-    this.counters[key] = (this.counters[key] ?? 0) + by;
-  }
-
-  private async flush(): Promise<void> {
-    const entries = Object.entries(this.counters);
-    if (!entries.length) return;
-    this.counters = {};
-    const pipeline = this.redis.pipeline();
-    for (const [key, value] of entries) pipeline.incrby(`cache:m:${key}`, value);
-    await pipeline.exec();
+    void this.redis.incrby(`cache:m:${key}`, by).catch(() => undefined);
   }
 
   async snapshot(): Promise<Record<string, number>> {
@@ -43,5 +23,16 @@ export class MetricsService implements OnModuleInit, OnModuleDestroy {
       out[k.replace('cache:m:', '')] = Number(values[i] ?? 0);
     });
     return out;
+  }
+
+  // Live remaining stock per product, for the dashboard.
+  async stockSnapshot(): Promise<Record<string, number>> {
+    const keys = await this.redis.keys('cache:stock:*');
+    const values = keys.length ? await this.redis.mget(keys) : [];
+    const stock: Record<string, number> = {};
+    keys.forEach((k, i) => {
+      stock[k.replace('cache:stock:', '')] = Number(values[i] ?? 0);
+    });
+    return stock;
   }
 }

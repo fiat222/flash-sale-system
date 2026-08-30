@@ -1,7 +1,7 @@
 import 'reflect-metadata';
 import { NestFactory } from '@nestjs/core';
 import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify';
-import { ValidationPipe, Logger } from '@nestjs/common';
+import { Logger, ValidationPipe } from '@nestjs/common';
 import { getQueueToken } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { AppModule } from './app.module';
@@ -21,9 +21,20 @@ async function runMigrate(): Promise<void> {
 }
 
 async function bootstrapHttp(): Promise<void> {
-  const app = await NestFactory.create<NestFastifyApplication>(AppModule, new FastifyAdapter());
+  const app = await NestFactory.create<NestFastifyApplication>(
+    AppModule,
+    // No per-request logging on the hot path — the load test drives thousands
+    // of req/s and Nest already logs bootstrap/errors separately.
+    new FastifyAdapter({ logger: false, disableRequestLogging: true }),
+  );
 
-  app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
+  const validationPipe = new ValidationPipe({
+    whitelist: true,
+    forbidNonWhitelisted: true,
+    transform: true,
+  });
+
+  app.useGlobalPipes(validationPipe);
 
   if (role === 'worker') {
     const queue = app.get<Queue>(getQueueToken('orders'));

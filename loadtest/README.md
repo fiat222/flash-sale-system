@@ -8,6 +8,8 @@ node loadtest/reset.js               # reset DB + Redis state (stack must alread
 k6 run -e BASE_URL=http://localhost loadtest/read.js
 k6 run -e BASE_URL=http://localhost loadtest/write.js
 k6 run -e BASE_URL=http://localhost loadtest/flash-sale.js
+docker run --rm  -v ${PWD}/loadtest:/loadtest -p 5665:5665 -e K6_WEB_DASHBOARD=true -e K6_WEB_DASHBOARD_EXPORT=/loadtest/report.html grafana/k6 run -e BASE_URL=http://172.30.58.10:8081 /loadtest/flash-sale.js
+# รันแบบมี dashboard
 ```
 
 Run `reset.js` before every `write.js` run (and before `read.js` if you care about
@@ -18,7 +20,7 @@ comparable cache-hit numbers across runs).
 | File | Scenario |
 |---|---|
 | `lib/auth.js` | shared helper — `getTokens(baseUrl, count, timeout)` issues JWTs via batched `POST /auth/token`; per-request timeout defaults to `REQ_TIMEOUT` (10s). `write.js` sets `setupTimeout: 30s` around it. |
-| `read.js` | 1,000 VU ramping (~50s: 10s ramp / 35s hold / 5s down), `GET /products?page=1&limit=10` (spec). Tunables at top of file, all env-overridable: `TARGET` `RAMP` `HOLD` `RAMPDOWN` `REQ_TIMEOUT` (10s). `-e MIX=1` → random page/limit + 5% garbage input. `teardown()` prints L1/L2/miss hit-ratio from `/api/v1/_metrics`. |
+| `read.js` | 1,000 VU ramping (~50s: 10s ramp / 35s hold / 5s down), `GET /products?page=1&limit=10` (spec). Tunables at top of file, all env-overridable: `TARGET` `RAMP` `HOLD` `RAMPDOWN` `REQ_TIMEOUT` (10s). `-e MIX=1` → random page/limit + 5% garbage input. `teardown()` prints the Redis cache hit/miss ratio from `/api/v1/_metrics`. |
 | `write.js` | 500 VU, one fixed user each, `POST /orders` on `p-1001`; every 10th VU fires 2-3 **concurrent** identical requests (`http.batch`) to race the SADD lock. Single burst — finishes in seconds. Tunables at top: `USER_COUNT` `MAX_DURATION` (50s) `REQ_TIMEOUT` (10s). `teardown()` prints order counters + manual-check reminders. |
 | `reset.js` | plain Node script — `docker compose exec` into `postgres`/`redis` to truncate orders, restore stock, clear claims/template/metrics cache |
 
@@ -36,7 +38,7 @@ its 500 tokens from `lib/auth.js` in `setup()`.
 
 | item | source | scripted? |
 |---|---|---|
-| cache hit/miss ratio (L1/L2) | `GET /api/v1/_metrics` | ✓ `read.js` `teardown()` prints it |
+| cache hit/miss ratio (Redis Cache-Aside, no in-process cache) | `GET /api/v1/_metrics` → `cache_hit` / `cache_miss` | ✓ `read.js` `teardown()` prints it |
 | order counters (accepted/duplicate/soldout) | `GET /api/v1/_metrics` | ✓ `write.js` `teardown()` prints it |
 | queue completed / failed / waiting, worker status | Bull-Board `http://localhost:3001/admin/queues` | manual |
 | req/s, p95, error rate | k6 summary output | ✓ |
