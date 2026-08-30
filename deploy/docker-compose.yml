@@ -33,6 +33,12 @@ x-api-common: &api-common
         # ceilings (read/write peaks don't overlap — k6 writes start at 33s).
         cpus: "0.55"
         memory: 424M
+  healthcheck:
+    test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/health/live || exit 1"]
+    interval: 10s
+    timeout: 5s
+    retries: 3
+    start_period: 60s
 
 services:
   nginx:
@@ -45,12 +51,12 @@ services:
     tmpfs:
       - /var/log/nginx:size=16m     # slow.log
     depends_on:
-      - api1
-      - api2
-      - api3
-      - api4
-      - api5
-      - api6
+      api1: { condition: service_healthy }
+      api2: { condition: service_healthy }
+      api3: { condition: service_healthy }
+      api4: { condition: service_healthy }
+      api5: { condition: service_healthy }
+      api6: { condition: service_healthy }
     restart: unless-stopped
     deploy:
       resources:
@@ -126,6 +132,12 @@ services:
           # POST latency.
           cpus: "0.35"
           memory: 384M
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3001/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
 
   migrate:
     image: ${BACKEND_IMAGE:-ghcr.io/fiat222/flash-sale-backend:latest}

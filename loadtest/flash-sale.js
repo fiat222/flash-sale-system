@@ -12,7 +12,9 @@
  *                  has to finish for everyone. Aborts the run if any != 200.
  *   2. read_load — timed, kept as short as still gives a stable p95; goal is
  *                  minimum duration + minimum failures. 1,000 concurrent VUs,
- *                  GET /api/v1/products?page=1&limit=10.
+ *                  GET /api/v1/products with page + limit rotated per request
+ *                  (limit in {5,10,20}); each response must echo the scope it
+ *                  was asked for and return exactly the rows in that window.
  *   3. write_load— timed the same way. 500 concurrent, POST /api/v1/orders for
  *                  p-1001 (stock 50); every Nth VU double/triple-fires
  *                  concurrently to exercise the duplicate-rights guard.
@@ -31,6 +33,11 @@ const BASE_URL = __ENV.BASE_URL || 'http://localhost';
 const USER_COUNT = Number(__ENV.USER_COUNT || 500); // unique users / JWTs
 const PRODUCT_ID = __ENV.PRODUCT_ID || 'p-1001'; // write contention target
 const REQ_TIMEOUT = __ENV.REQ_TIMEOUT || '10s'; // per-request HTTP timeout
+const TOTAL_PRODUCTS = Number(__ENV.TOTAL_PRODUCTS || 20); // catalogue size (spec §2.2 example: total 20)
+const READ_LIMITS = String(__ENV.READ_LIMITS || '5,10,20') // limit values the read phase rotates through
+  .split(',')
+  .map((n) => Number(n.trim()))
+  .filter((n) => n > 0);
 
 // -- read phase: minimise wall time while still hitting a true 1,000-VU plateau.
 // Ramp is gentle on purpose — a 5s slam to 1,000 VUs stampedes the api tier
@@ -133,22 +140,31 @@ export function setup() {
 
 // ============================ 2. read phase ===============================
 export function readScenario() {
-  const res = http.get(`${BASE_URL}/api/v1/products?page=1&limit=10`, { ...REQ, tags: { name: 'products' } });
+  // Rotate page + limit (spec §3 note: "Load test มีการลองเปลี่ยน page, limit บ้าง").
+  // Varying the query also spreads cache keys, so read_cache_hit_pct reflects a
+  // realistic multi-key workload rather than a single hot key.
+  const limit = READ_LIMITS[Math.floor(Math.random() * READ_LIMITS.length)];
+  const maxPage = Math.max(1, Math.ceil(TOTAL_PRODUCTS / limit));
+  const page = 1 + Math.floor(Math.random() * maxPage);
+  const expectedRows = Math.min(limit, Math.max(0, TOTAL_PRODUCTS - (page - 1) * limit));
+
+  const res = http.get(`${BASE_URL}/api/v1/products?page=${page}&limit=${limit}`, { ...REQ, tags: { name: 'products' } });
 
   check(res, {
     'read: status 200': (r) => r.status === 200,
-    'read: has meta': (r) => {
+    // spec §2.2 challenge: response must echo the exact scope it was asked for.
+    'read: meta echoes scope': (r) => {
       try {
         const j = r.json();
-        return !!j && !!j.meta && j.meta.page === 1 && j.meta.limit === 10;
+        return !!j && !!j.meta && j.meta.page === page && j.meta.limit === limit;
       } catch (e) {
         return false;
       }
     },
-    'read: data <= limit': (r) => {
+    'read: rows match page window': (r) => {
       try {
         const j = r.json();
-        return Array.isArray(j.data) && j.data.length <= 10;
+        return Array.isArray(j.data) && j.data.length <= limit && j.data.length === expectedRows;
       } catch (e) {
         return false;
       }
@@ -272,15 +288,22 @@ export function teardown() {
   const q = m.queue || {};
   const hit = c.cache_hit || 0;
   const miss = c.cache_miss || 0;
+  const dbBuild = c.db_build || 0; // misses that actually reached Postgres (rest were coalesced)
+  const waitHit = c.cache_wait_hit || 0; // misses parked on the L2 lock, served once the builder published
+  const waitTimeout = c.cache_wait_timeout || 0; // waited out WAIT_MAX_MS, built uncached
   const tot = hit + miss || 1;
   const pct = (n) => ((n / tot) * 100).toFixed(2);
+  const coalesced = miss > 0 ? (((miss - dbBuild) / miss) * 100).toFixed(2) : '0.00';
 
   const lines = [
     '',
     '================  CACHE CHECK (GET /api/v1/_metrics)  ================',
     `  Redis hit             : ${hit}  (${pct(hit)}%)`,
-    `  miss (Postgres build) : ${miss}  (${pct(miss)}%)`,
+    `  miss (cold key)       : ${miss}  (${pct(miss)}%)`,
     `  HIT / MISS ratio      : ${pct(hit)}%  /  ${pct(miss)}%`,
+    `  Postgres builds       : ${dbBuild}   (${coalesced}% of misses coalesced by L1+L2 single-flight)`,
+    `  parked on L2 lock     : ${waitHit}  served after builder published`,
+    `  L2 wait timeouts      : ${waitTimeout}  (built uncached to stay responsive)`,
     '',
     '================  QUEUE CHECK  ======================================',
     `  waiting=${q.waiting ?? '?'}  active=${q.active ?? '?'}  delayed=${q.delayed ?? '?'}`,
