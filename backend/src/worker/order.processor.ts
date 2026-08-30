@@ -6,7 +6,6 @@ import Redis from 'ioredis';
 import { Product } from '../database/entities/product.entity';
 import { Order } from '../database/entities/order.entity';
 import { REDIS_CLIENT } from '../redis/redis.provider';
-import { ProductsService } from '../products/products.service';
 import { MetricsService } from '../metrics/metrics.service';
 import { OrderJobData } from '../orders/orders.service';
 
@@ -17,7 +16,6 @@ export class OrderProcessor extends WorkerHost {
   constructor(
     private readonly dataSource: DataSource,
     @Inject(REDIS_CLIENT) private readonly redis: Redis,
-    private readonly productsService: ProductsService,
     private readonly metrics: MetricsService,
   ) {
     super();
@@ -55,7 +53,9 @@ export class OrderProcessor extends WorkerHost {
       throw err;
     }
 
-    await this.productsService.invalidate();
+    // No cache invalidation: the product list caches only master data. The
+    // deducted remainingStock is spliced live from `cache:stock:*` on every
+    // read (already decremented at enqueue), so no cached template is stale.
   }
 
   // Compensation: only for jobs that exhausted retries on a transient failure.
