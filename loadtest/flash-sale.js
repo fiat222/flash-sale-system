@@ -288,15 +288,22 @@ export function teardown() {
   const q = m.queue || {};
   const hit = c.cache_hit || 0;
   const miss = c.cache_miss || 0;
+  const dbBuild = c.db_build || 0; // misses that actually reached Postgres (rest were coalesced)
+  const waitHit = c.cache_wait_hit || 0; // misses parked on the L2 lock, served once the builder published
+  const waitTimeout = c.cache_wait_timeout || 0; // waited out WAIT_MAX_MS, built uncached
   const tot = hit + miss || 1;
   const pct = (n) => ((n / tot) * 100).toFixed(2);
+  const coalesced = miss > 0 ? (((miss - dbBuild) / miss) * 100).toFixed(2) : '0.00';
 
   const lines = [
     '',
     '================  CACHE CHECK (GET /api/v1/_metrics)  ================',
     `  Redis hit             : ${hit}  (${pct(hit)}%)`,
-    `  miss (Postgres build) : ${miss}  (${pct(miss)}%)`,
+    `  miss (cold key)       : ${miss}  (${pct(miss)}%)`,
     `  HIT / MISS ratio      : ${pct(hit)}%  /  ${pct(miss)}%`,
+    `  Postgres builds       : ${dbBuild}   (${coalesced}% of misses coalesced by L1+L2 single-flight)`,
+    `  parked on L2 lock     : ${waitHit}  served after builder published`,
+    `  L2 wait timeouts      : ${waitTimeout}  (built uncached to stay responsive)`,
     '',
     '================  QUEUE CHECK  ======================================',
     `  waiting=${q.waiting ?? '?'}  active=${q.active ?? '?'}  delayed=${q.delayed ?? '?'}`,

@@ -14,6 +14,7 @@ describe('ProductsService', () => {
     mget: jest.Mock;
     scan: jest.Mock;
     del: jest.Mock;
+    eval: jest.Mock;
   };
   let repo: { findAndCount: jest.Mock };
 
@@ -21,13 +22,19 @@ describe('ProductsService', () => {
     store = new Map();
     redis = {
       get: jest.fn((k: string) => Promise.resolve(store.has(k) ? store.get(k) : null)),
-      set: jest.fn((k: string, v: string) => {
+      // Mirrors ioredis: `SET k v ... NX` returns null when the key already exists.
+      set: jest.fn((k: string, v: string, ...rest: unknown[]) => {
+        if (rest.includes('NX') && store.has(k)) return Promise.resolve(null);
         store.set(k, v);
         return Promise.resolve('OK');
       }),
       mget: jest.fn(),
       scan: jest.fn(),
       del: jest.fn(),
+      eval: jest.fn((_lua: string, _n: number, k: string) => {
+        store.delete(k);
+        return Promise.resolve(1);
+      }),
     };
     repo = { findAndCount: jest.fn() };
 
@@ -95,6 +102,29 @@ describe('ProductsService', () => {
     await Promise.all(calls);
 
     expect(repo.findAndCount).toHaveBeenCalledTimes(1); // not 3
+  });
+
+  it('L2: a waiter returns the page another instance publishes while holding the Redis lock', async () => {
+    repo.findAndCount.mockResolvedValue([[], 0]);
+    redis.mget.mockResolvedValue([]);
+
+    // Simulate the cross-instance lock already being held elsewhere.
+    redis.set.mockImplementation((k: string, v: string, ...rest: unknown[]) => {
+      if (k.startsWith('lock:') && rest.includes('NX')) return Promise.resolve(null);
+      store.set(k, v);
+      return Promise.resolve('OK');
+    });
+
+    const pending = service.getPage(9, 10);
+    // The other instance finishes its build and publishes the page.
+    store.set(
+      'cache:products:page:9:limit:10',
+      JSON.stringify({ status: 'success', data: [], meta: { total: 0, page: 9, limit: 10, totalPages: 0 } }),
+    );
+
+    const body = await pending;
+    expect(body.meta.page).toBe(9);
+    expect(repo.findAndCount).not.toHaveBeenCalled(); // the waiter never touched Postgres
   });
 
   it('invalidate() SCANs and deletes every cached product page', async () => {
