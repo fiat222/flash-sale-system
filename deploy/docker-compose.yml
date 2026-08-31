@@ -57,6 +57,7 @@ services:
       api4: { condition: service_healthy }
       api5: { condition: service_healthy }
       api6: { condition: service_healthy }
+      worker: { condition: service_healthy }
     restart: unless-stopped
     deploy:
       resources:
@@ -114,8 +115,9 @@ services:
     environment:
       ROLE: worker
       NODE_OPTIONS: ${NODE_OPTIONS}
-    ports:
-      - "${WORKER_PORT}:${WORKER_PORT}"
+    # No host port mapping — Bull-Board is reached only via nginx's
+    # /admin/queues proxy_pass over the internal docker network. Only :80
+    # (nginx) should be reachable from outside the VM.
     depends_on:
       postgres:
         condition: service_healthy
