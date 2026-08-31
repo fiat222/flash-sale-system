@@ -39,6 +39,13 @@ export class MetricsService {
     return out;
   }
 
+  // Worker liveness for the dashboard/report (Queue Monitoring: "worker
+  // status"). The worker refreshes this key every 2s with a 5s TTL, so a
+  // missing key means it's down or hasn't started yet.
+  async workerStatus(): Promise<'up' | 'down'> {
+    return (await this.redis.exists('worker:heartbeat')) ? 'up' : 'down';
+  }
+
   // Live remaining stock per product, for the dashboard. SCAN (cursor, non-
   // blocking) rather than KEYS so a dashboard poll can't stall the event loop
   // of the Redis under test.

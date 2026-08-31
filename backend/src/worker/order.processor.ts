@@ -1,4 +1,4 @@
-import { Inject, Logger } from '@nestjs/common';
+import { Inject, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { OnWorkerEvent, Processor, WorkerHost } from '@nestjs/bullmq';
 import { Job, UnrecoverableError } from 'bullmq';
 import { DataSource } from 'typeorm';
@@ -9,9 +9,17 @@ import { REDIS_CLIENT } from '../redis/redis.provider';
 import { MetricsService } from '../metrics/metrics.service';
 import { OrderJobData } from '../orders/orders.service';
 
+// Key + cadence for the worker liveness heartbeat (Queue Monitoring: "worker
+// status" in the report). TTL > interval so a dead/stuck worker's heartbeat
+// naturally expires — no explicit down-marking needed.
+export const WORKER_HEARTBEAT_KEY = 'worker:heartbeat';
+const HEARTBEAT_INTERVAL_MS = 2000;
+const HEARTBEAT_TTL_SECONDS = 5;
+
 @Processor('orders', { concurrency: Number(process.env.WORKER_CONCURRENCY ?? 30) })
-export class OrderProcessor extends WorkerHost {
+export class OrderProcessor extends WorkerHost implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(OrderProcessor.name);
+  private heartbeatTimer?: NodeJS.Timeout;
 
   constructor(
     private readonly dataSource: DataSource,
@@ -19,6 +27,16 @@ export class OrderProcessor extends WorkerHost {
     private readonly metrics: MetricsService,
   ) {
     super();
+  }
+
+  onModuleInit(): void {
+    const beat = () => void this.redis.set(WORKER_HEARTBEAT_KEY, Date.now(), 'EX', HEARTBEAT_TTL_SECONDS).catch(() => undefined);
+    beat();
+    this.heartbeatTimer = setInterval(beat, HEARTBEAT_INTERVAL_MS);
+  }
+
+  onModuleDestroy(): void {
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
   }
 
   // Lifetime queue totals for the report (spec 3, Queue Monitoring). Bull-Board
