@@ -119,7 +119,11 @@ export const options = {
     'checks{scenario:write_load}': ['rate>0.99'],
     data_integrity_ok: ['rate>0.99'], // remainingStock must be 0 after the drain
   },
-  summaryTrendStats: ['avg', 'med', 'p(90)', 'p(95)', 'p(99)', 'max'],
+  // 'min' is required for write_start_ts (handleSummary derives the write
+  // burst's span from write_start_ts.min / write_end_ts.max) — without it
+  // the missing stat silently defaults to 0, blowing up the span and
+  // flooring write req/s to ~0.
+  summaryTrendStats: ['avg', 'med', 'p(90)', 'p(95)', 'p(99)', 'min', 'max'],
 };
 
 // ============================ 1. setup: 500 JWTs ==========================
