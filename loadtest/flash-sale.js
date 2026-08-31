@@ -70,6 +70,12 @@ const ordersDuplicate = new Counter('orders_duplicate'); // HTTP 409 already-cla
 const readCacheHitPct = new Trend('read_cache_hit_pct'); // sampled during read phase
 const writeQueueBacklog = new Trend('write_queue_backlog'); // waiting+active, sampled during write
 const dataIntegrityOk = new Rate('data_integrity_ok'); // post-burst remainingStock == 0
+// Wall-clock span of the write burst (min/max across all VUs), so write req/s
+// is measured against its own duration instead of the whole test's — write_load
+// is a few-second burst tacked onto a 30s+ read phase, so http_reqs' built-in
+// 'rate' (count / total test duration) would understate it by 10x+.
+const writeStartTs = new Trend('write_start_ts');
+const writeEndTs = new Trend('write_end_ts');
 
 const REQ = { timeout: REQ_TIMEOUT };
 const JSON_HDR = { 'Content-Type': 'application/json' };
@@ -182,6 +188,7 @@ export function writeScenario(data) {
   const params = { ...REQ, headers: { ...JSON_HDR, Authorization: `Bearer ${token}` }, tags: { name: 'orders' } };
   const body = JSON.stringify({ productId: PRODUCT_ID });
 
+  writeStartTs.add(Date.now());
   if (__VU % DOUBLE_TAP_EVERY === 0) {
     // Double / triple tap: 2-3 identical requests fired CONCURRENTLY (http.batch)
     // so they actually race the SADD lock, not run one after another.
@@ -191,7 +198,7 @@ export function writeScenario(data) {
   } else {
     tallyOrder(http.post(`${BASE_URL}/api/v1/orders`, body, params));
   }
-
+  writeEndTs.add(Date.now());
 }
 
 function tallyOrder(res) {
@@ -362,6 +369,13 @@ export function handleSummary(data) {
   const rd = 'http_req_duration{scenario:read_load}';
   const wd = 'http_req_duration{scenario:write_load}';
 
+  // Write req/s off the burst's own wall-clock span (min/max of per-request
+  // timestamps), not http_reqs' built-in rate — that divides by the WHOLE
+  // test duration (read phase included), understating a short write burst.
+  const writeReqCount = g('orders_accepted', 'count') + g('orders_soldout', 'count') + g('orders_duplicate', 'count');
+  const writeSpanMs = g('write_end_ts', 'max') - g('write_start_ts', 'min');
+  const writeReqRate = writeSpanMs > 0 ? writeReqCount / (writeSpanMs / 1000) : writeReqCount;
+
   // handleSummary replaces k6's default end-of-test output, so surface the
   // threshold gate results explicitly.
   const thresholdLines = [];
@@ -389,6 +403,7 @@ export function handleSummary(data) {
     `    orders accepted .. ${g('orders_accepted', 'count')}   (expect 50)`,
     `    409 sold out ..... ${g('orders_soldout', 'count')}`,
     `    409 duplicate .... ${g('orders_duplicate', 'count')}`,
+    `    requests ......... ${writeReqCount}   (${f2(writeReqRate)}/s over the burst)`,
     `    p95 latency ...... ${f2(g(wd, 'p(95)'))} ms   (max ${f2(g(wd, 'max'))} ms)`,
     `    checks .......... ${f2(g('checks{scenario:write_load}', 'rate') * 100)}% pass`,
     `    queue backlog .... peak ${g('write_queue_backlog', 'max')} (waiting+active, sampled)`,
@@ -428,8 +443,10 @@ export function handleSummary(data) {
     },
     throughputAndLatency: {
       totalRequests: g('http_reqs', 'count'),
-      requestsPerSecond: Number(readReqRate),
+      requestsPerSecond: Number(readReqRate), // read phase dominates total count; treat as read-phase rps
       readP95Ms: Number(f2(g(rd, 'p(95)'))),
+      writeRequests: writeReqCount,
+      writeRequestsPerSecond: Number(f2(writeReqRate)),
       writeP95Ms: Number(f2(g(wd, 'p(95)'))),
       errorRatePct: Number(errorRatePct),
     },
@@ -459,7 +476,7 @@ export function handleSummary(data) {
     `    accepted / sold-out / duplicate .. ${reportTable.queueMonitoring.ordersAccepted} / ${reportTable.queueMonitoring.ordersSoldOut409} / ${reportTable.queueMonitoring.ordersDuplicate409}`,
     '  Throughput & Latency',
     `    total requests .......... ${reportTable.throughputAndLatency.totalRequests}`,
-    `    req/s (overall) ......... ${reportTable.throughputAndLatency.requestsPerSecond}`,
+    `    req/s read / write ...... ${reportTable.throughputAndLatency.requestsPerSecond} / ${reportTable.throughputAndLatency.writeRequestsPerSecond}`,
     `    p95 read / write ........ ${reportTable.throughputAndLatency.readP95Ms} ms / ${reportTable.throughputAndLatency.writeP95Ms} ms`,
     `    error rate .............. ${reportTable.throughputAndLatency.errorRatePct}%`,
     '  Data Integrity Proof',
