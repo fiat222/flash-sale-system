@@ -70,6 +70,12 @@ const ordersDuplicate = new Counter('orders_duplicate'); // HTTP 409 already-cla
 const readCacheHitPct = new Trend('read_cache_hit_pct'); // sampled during read phase
 const writeQueueBacklog = new Trend('write_queue_backlog'); // waiting+active, sampled during write
 const dataIntegrityOk = new Rate('data_integrity_ok'); // post-burst remainingStock == 0
+// Wall-clock span of the write burst (min/max across all VUs), so write req/s
+// is measured against its own duration instead of the whole test's — write_load
+// is a few-second burst tacked onto a 30s+ read phase, so http_reqs' built-in
+// 'rate' (count / total test duration) would understate it by 10x+.
+const writeStartTs = new Trend('write_start_ts');
+const writeEndTs = new Trend('write_end_ts');
 
 const REQ = { timeout: REQ_TIMEOUT };
 const JSON_HDR = { 'Content-Type': 'application/json' };
@@ -113,7 +119,11 @@ export const options = {
     'checks{scenario:write_load}': ['rate>0.99'],
     data_integrity_ok: ['rate>0.99'], // remainingStock must be 0 after the drain
   },
-  summaryTrendStats: ['avg', 'med', 'p(90)', 'p(95)', 'p(99)', 'max'],
+  // 'min' is required for write_start_ts (handleSummary derives the write
+  // burst's span from write_start_ts.min / write_end_ts.max) — without it
+  // the missing stat silently defaults to 0, blowing up the span and
+  // flooring write req/s to ~0.
+  summaryTrendStats: ['avg', 'med', 'p(90)', 'p(95)', 'p(99)', 'min', 'max'],
 };
 
 // ============================ 1. setup: 500 JWTs ==========================
@@ -182,6 +192,7 @@ export function writeScenario(data) {
   const params = { ...REQ, headers: { ...JSON_HDR, Authorization: `Bearer ${token}` }, tags: { name: 'orders' } };
   const body = JSON.stringify({ productId: PRODUCT_ID });
 
+  writeStartTs.add(Date.now());
   if (__VU % DOUBLE_TAP_EVERY === 0) {
     // Double / triple tap: 2-3 identical requests fired CONCURRENTLY (http.batch)
     // so they actually race the SADD lock, not run one after another.
@@ -191,7 +202,7 @@ export function writeScenario(data) {
   } else {
     tallyOrder(http.post(`${BASE_URL}/api/v1/orders`, body, params));
   }
-
+  writeEndTs.add(Date.now());
 }
 
 function tallyOrder(res) {
@@ -243,6 +254,11 @@ function fetchMetrics() {
   }
 }
 
+// Snapshot handed off to handleSummary() for the REPORT TABLE section — k6
+// runs teardown() and handleSummary() in the same init-context VU, so a
+// module-level var is the simplest way to bridge them.
+let reportSnapshot = null;
+
 // ============================ teardown: cache + queue snapshot =============
 export function teardown() {
   // Poll until the queue is fully drained (or give up) so the Data Integrity
@@ -277,6 +293,7 @@ export function teardown() {
     dataIntegrityOk.add(ok);
     check(null, { 'integrity: remainingStock == 0 after drain': () => ok });
     integrityLine = `  remainingStock after drain : ${rs}  (${ok ? 'OK' : 'STALE / WRONG'})`;
+    reportSnapshot = { remainingStock: rs, integrityOk: ok, workerStatus: 'unknown' };
   }
 
   if (!m) {
@@ -286,6 +303,7 @@ export function teardown() {
   }
   const c = m.metrics || {};
   const q = m.queue || {};
+  const workerStatus = m.workerStatus || 'unknown';
   const hit = c.cache_hit || 0;
   const miss = c.cache_miss || 0;
   const dbBuild = c.db_build || 0; // misses that actually reached Postgres (rest were coalesced)
@@ -306,6 +324,7 @@ export function teardown() {
     `  L2 wait timeouts      : ${waitTimeout}  (built uncached to stay responsive)`,
     '',
     '================  QUEUE CHECK  ======================================',
+    `  worker status         : ${workerStatus.toUpperCase()}`,
     `  waiting=${q.waiting ?? '?'}  active=${q.active ?? '?'}  delayed=${q.delayed ?? '?'}`,
     `  completed (lifetime) : ${c.orders_completed || 0}`,
     `  failed    (lifetime) : ${c.orders_failed || 0}`,
@@ -322,6 +341,22 @@ export function teardown() {
     '',
   ];
   console.log(lines.join('\n'));
+
+  reportSnapshot = {
+    ...reportSnapshot,
+    workerStatus,
+    cacheHit: hit,
+    cacheMiss: miss,
+    cacheHitPct: Number(pct(hit)),
+    queueWaiting: q.waiting ?? null,
+    queueActive: q.active ?? null,
+    queueCompletedLifetime: c.orders_completed || 0,
+    queueFailedLifetime: c.orders_failed || 0,
+    ordersAccepted: c.orders_accepted || 0,
+    ordersSoldout: c.orders_soldout || 0,
+    ordersDuplicate: c.orders_duplicate || 0,
+    peakQueueBacklog: peakBacklog,
+  };
 }
 
 // ============================ summary =====================================
@@ -337,6 +372,13 @@ export function handleSummary(data) {
 
   const rd = 'http_req_duration{scenario:read_load}';
   const wd = 'http_req_duration{scenario:write_load}';
+
+  // Write req/s off the burst's own wall-clock span (min/max of per-request
+  // timestamps), not http_reqs' built-in rate — that divides by the WHOLE
+  // test duration (read phase included), understating a short write burst.
+  const writeReqCount = g('orders_accepted', 'count') + g('orders_soldout', 'count') + g('orders_duplicate', 'count');
+  const writeSpanMs = g('write_end_ts', 'max') - g('write_start_ts', 'min');
+  const writeReqRate = writeSpanMs > 0 ? writeReqCount / (writeSpanMs / 1000) : writeReqCount;
 
   // handleSummary replaces k6's default end-of-test output, so surface the
   // threshold gate results explicitly.
@@ -365,6 +407,7 @@ export function handleSummary(data) {
     `    orders accepted .. ${g('orders_accepted', 'count')}   (expect 50)`,
     `    409 sold out ..... ${g('orders_soldout', 'count')}`,
     `    409 duplicate .... ${g('orders_duplicate', 'count')}`,
+    `    requests ......... ${writeReqCount}   (${f2(writeReqRate)}/s over the burst)`,
     `    p95 latency ...... ${f2(g(wd, 'p(95)'))} ms   (max ${f2(g(wd, 'max'))} ms)`,
     `    checks .......... ${f2(g('checks{scenario:write_load}', 'rate') * 100)}% pass`,
     `    queue backlog .... peak ${g('write_queue_backlog', 'max')} (waiting+active, sampled)`,
@@ -378,8 +421,79 @@ export function handleSummary(data) {
     '',
   ].join('\n');
 
-  const out = { stdout: banner };
-  const path = __ENV.SUMMARY_PATH || 'loadtest/results/flash-sale-summary.json';
-  out[path] = JSON.stringify(data, null, 2);
+  // ---- REPORT TABLE — the 4 items the group report/dashboard must show ----
+  // (Cache Performance, Queue Monitoring, Throughput & Latency, Data
+  // Integrity). Markdown so it can be pasted straight into the report doc;
+  // the same numbers are also written to results/report-table.json.
+  const s = reportSnapshot || {};
+  const readReqRate = f2(g('http_reqs', 'rate'));
+  const errorRatePct = f2(g('infra_failures', 'rate') * 100);
+  const reportTable = {
+    cachePerformance: {
+      cacheHit: s.cacheHit ?? null,
+      cacheMiss: s.cacheMiss ?? null,
+      cacheHitPct: s.cacheHitPct ?? null,
+    },
+    queueMonitoring: {
+      workerStatus: s.workerStatus ?? 'unknown',
+      jobsWaiting: s.queueWaiting ?? null,
+      jobsActive: s.queueActive ?? null,
+      peakBacklog: s.peakQueueBacklog ?? g('write_queue_backlog', 'max'),
+      completedLifetime: s.queueCompletedLifetime ?? null,
+      failedLifetime: s.queueFailedLifetime ?? null,
+      ordersAccepted: s.ordersAccepted ?? g('orders_accepted', 'count'),
+      ordersSoldOut409: s.ordersSoldout ?? g('orders_soldout', 'count'),
+      ordersDuplicate409: s.ordersDuplicate ?? g('orders_duplicate', 'count'),
+    },
+    throughputAndLatency: {
+      totalRequests: g('http_reqs', 'count'),
+      requestsPerSecond: Number(readReqRate), // read phase dominates total count; treat as read-phase rps
+      readP95Ms: Number(f2(g(rd, 'p(95)'))),
+      writeRequests: writeReqCount,
+      writeRequestsPerSecond: Number(f2(writeReqRate)),
+      writeP95Ms: Number(f2(g(wd, 'p(95)'))),
+      errorRatePct: Number(errorRatePct),
+    },
+    dataIntegrity: {
+      remainingStock: s.remainingStock ?? null,
+      remainingStockOk: !!s.integrityOk,
+      // Manual: capture a DB screenshot for
+      //   SELECT COUNT(*) total_orders, COUNT(DISTINCT user_id) distinct_users,
+      //          MAX(cnt) max_orders_per_user
+      //   FROM (SELECT user_id, COUNT(*) cnt FROM orders
+      //         WHERE product_id = '<PRODUCT_ID>' GROUP BY user_id) x;
+      // Expect total_orders == distinct_users == 50 and max_orders_per_user == 1.
+      note: 'distinct-user / max-per-user counts require a DB screenshot — see loadtest/README.md',
+    },
+  };
+
+  const tableLines = [
+    '',
+    '================  REPORT TABLE (copy into the group report)  =======',
+    '  Cache Performance',
+    `    hit / miss ............ ${reportTable.cachePerformance.cacheHit} / ${reportTable.cachePerformance.cacheMiss}`,
+    `    hit ratio .............. ${reportTable.cachePerformance.cacheHitPct}%`,
+    '  Queue Monitoring',
+    `    worker status .......... ${reportTable.queueMonitoring.workerStatus.toUpperCase()}`,
+    `    jobs waiting/active .... ${reportTable.queueMonitoring.jobsWaiting} / ${reportTable.queueMonitoring.jobsActive}  (peak backlog ${reportTable.queueMonitoring.peakBacklog})`,
+    `    completed / failed ..... ${reportTable.queueMonitoring.completedLifetime} / ${reportTable.queueMonitoring.failedLifetime}`,
+    `    accepted / sold-out / duplicate .. ${reportTable.queueMonitoring.ordersAccepted} / ${reportTable.queueMonitoring.ordersSoldOut409} / ${reportTable.queueMonitoring.ordersDuplicate409}`,
+    '  Throughput & Latency',
+    `    total requests .......... ${reportTable.throughputAndLatency.totalRequests}`,
+    `    req/s read / write ...... ${reportTable.throughputAndLatency.requestsPerSecond} / ${reportTable.throughputAndLatency.writeRequestsPerSecond}`,
+    `    p95 read / write ........ ${reportTable.throughputAndLatency.readP95Ms} ms / ${reportTable.throughputAndLatency.writeP95Ms} ms`,
+    `    error rate .............. ${reportTable.throughputAndLatency.errorRatePct}%`,
+    '  Data Integrity Proof',
+    `    remainingStock after drain .. ${reportTable.dataIntegrity.remainingStock}  (${reportTable.dataIntegrity.remainingStockOk ? 'OK' : 'FAIL'})`,
+    `    orders table check ...... manual DB screenshot — see loadtest/README.md`,
+    '======================================================================',
+    '',
+  ];
+
+  const out = { stdout: banner + tableLines.join('\n') };
+  const summaryPath = __ENV.SUMMARY_PATH || 'loadtest/results/flash-sale-summary.json';
+  const tablePath = __ENV.REPORT_TABLE_PATH || 'loadtest/results/report-table.json';
+  out[summaryPath] = JSON.stringify(data, null, 2);
+  out[tablePath] = JSON.stringify(reportTable, null, 2);
   return out;
 }

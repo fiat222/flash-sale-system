@@ -10,10 +10,24 @@ const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
+// Two known layouts:
+//   repo checkout — reset.js in loadtest/, files under deploy/ and backend/data/
+//   server deploy — reset.js at project root, files as direct siblings
 const ROOT = path.resolve(__dirname, '..');
-const COMPOSE_FILE = path.join(ROOT, 'deploy', 'docker-compose.yml');
-const ENV_FILE = path.join(ROOT, 'deploy', '.env');
-const SEED_FILE = path.join(ROOT, 'backend', 'data', 'products-seed.json');
+const firstExisting = (candidates) => candidates.find((p) => fs.existsSync(p)) ?? candidates[0];
+
+const COMPOSE_FILE = firstExisting([
+  path.join(ROOT, 'deploy', 'docker-compose.yml'),
+  path.join(__dirname, 'docker-compose.yml'),
+]);
+const ENV_FILE = firstExisting([
+  path.join(ROOT, 'deploy', '.env'),
+  path.join(__dirname, '.env'),
+]);
+const SEED_FILE = firstExisting([
+  path.join(ROOT, 'backend', 'data', 'products-seed.json'),
+  path.join(__dirname, 'data', 'products-seed.json'),
+]);
 
 function loadEnv(file) {
   const env = {};
@@ -61,7 +75,11 @@ function main() {
   }
 
   console.log('Clearing product page cache + metrics counters so ratios start clean...');
-  const cacheKeys = [...scanKeys('cache:products:page:*'), ...scanKeys('cache:m:*')];
+  const cacheKeys = [
+    ...scanKeys('cache:products:tpl:*'),
+    'cache:products:tplkeys',
+    ...scanKeys('cache:m:*'),
+  ];
   for (let i = 0; i < cacheKeys.length; i += 400) {
     compose('exec', '-T', 'redis', 'redis-cli', 'DEL', ...cacheKeys.slice(i, i + 400));
   }

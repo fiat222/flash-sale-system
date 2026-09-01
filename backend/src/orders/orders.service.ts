@@ -5,7 +5,6 @@ import { readFileSync } from 'fs';
 import { join } from 'path';
 import Redis from 'ioredis';
 import { REDIS_CLIENT } from '../redis/redis.provider';
-import { MetricsService } from '../metrics/metrics.service';
 
 const CLAIM_STOCK_SCRIPT = readFileSync(join(__dirname, 'lua/claim-stock.lua'), 'utf-8');
 
@@ -28,7 +27,6 @@ export class OrdersService {
   constructor(
     @Inject(REDIS_CLIENT) redis: Redis,
     @InjectQueue('orders') private readonly ordersQueue: Queue<OrderJobData>,
-    private readonly metrics: MetricsService,
   ) {
     this.redis = redis as RedisWithClaim;
     if (typeof this.redis.claimStock !== 'function') {
@@ -37,6 +35,8 @@ export class OrdersService {
   }
 
   async claim(userId: string, productId: string) {
+    // Lua script increments orders_accepted/duplicate/soldout counters itself —
+    // one round trip per request instead of claim + separate metrics INCR.
     const result = await this.redis.claimStock(
       `cache:claim:${productId}`,
       `cache:stock:${productId}`,
@@ -44,14 +44,11 @@ export class OrdersService {
     );
 
     if (result === -1) {
-      this.metrics.increment('orders_duplicate');
       throw new ConflictException({ status: 'rejected', message: 'You already claimed this product' });
     }
     if (result === -2) {
-      this.metrics.increment('orders_soldout');
       throw new ConflictException({ status: 'rejected', message: 'Product sold out' });
     }
-    this.metrics.increment('orders_accepted');
 
     const job = await this.ordersQueue.add(
       'deduct',

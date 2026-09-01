@@ -8,9 +8,24 @@ node loadtest/reset.js               # reset DB + Redis state (stack must alread
 k6 run -e BASE_URL=http://172.30.58.10 loadtest/read.js
 k6 run -e BASE_URL=http://172.30.58.10 loadtest/write.js
 k6 run -e BASE_URL=http://172.30.58.10 loadtest/flash-sale.js
-docker run --rm  -v ${PWD}/loadtest:/loadtest -p 5665:5665 -e K6_WEB_DASHBOARD=true -e K6_WEB_DASHBOARD_EXPORT=/loadtest/report.html grafana/k6 run -e BASE_URL=http://172.30.58.10 /loadtest/flash-sale.js
-# รันแบบมี dashboard
+
+# with the k6 web dashboard (live during the run) + an HTML export for the report
+K6_WEB_DASHBOARD=true K6_WEB_DASHBOARD_EXPORT=loadtest/results/report.html \
+  k6 run -e BASE_URL=http://172.30.58.10 loadtest/flash-sale.js
+
+# same, via the grafana/k6 docker image
+docker run --rm -v ${PWD}/loadtest:/loadtest -p 5665:5665 \
+  -e K6_WEB_DASHBOARD=true -e K6_WEB_DASHBOARD_EXPORT=/loadtest/results/report.html \
+  grafana/k6 run -e BASE_URL=http://172.30.58.10 /loadtest/flash-sale.js
 ```
+
+`flash-sale.js` also writes `loadtest/results/report-table.json` on every run — the 4
+report categories (Cache Performance, Queue Monitoring, Throughput & Latency, Data
+Integrity) as flat numbers, ready to paste into a spreadsheet/table. The same numbers
+print as a `REPORT TABLE` block at the end of the console summary.
+
+Live view of the app-side numbers (cache hit%, worker UP/DOWN, queue depth, order
+outcomes, live stock) during a run: `GET /api/v1/_dashboard`.
 
 Run `reset.js` before every `write.js` run (and before `read.js` if you care about
 comparable cache-hit numbers across runs).
@@ -38,19 +53,30 @@ its 500 tokens from `lib/auth.js` in `setup()`.
 
 | item | source | scripted? |
 |---|---|---|
-| cache hit/miss ratio (Redis Cache-Aside, no in-process cache) | `GET /api/v1/_metrics` → `cache_hit` / `cache_miss` | ✓ `read.js` `teardown()` prints it |
-| order counters (accepted/duplicate/soldout) | `GET /api/v1/_metrics` | ✓ `write.js` `teardown()` prints it |
-| queue completed / failed / waiting, worker status | Bull-Board `http://localhost:3001/admin/queues` | manual |
-| req/s, p95, error rate | k6 summary output | ✓ |
+| cache hit/miss ratio (Redis Cache-Aside, no in-process cache) | `GET /api/v1/_metrics` → `cache_hit` / `cache_miss` | ✓ `flash-sale.js`/`read.js` `teardown()` prints it, in `report-table.json` |
+| worker status (UP/DOWN) | `GET /api/v1/_metrics` → `workerStatus` (worker writes a 2s heartbeat, 5s TTL) | ✓ printed + dashboarded |
+| jobs waiting/active/delayed, completed/failed (lifetime) | `GET /api/v1/_metrics` → `queue`, `metrics.orders_completed/failed` | ✓ printed + dashboarded |
+| Bull-Board window (last N jobs only) | `http://<host>/admin/queues` (nginx-proxied — no direct :3001 access) | manual, cross-check only |
+| req/s, p95, error rate | k6 summary output / `report-table.json` | ✓ |
+| data integrity (remainingStock, no duplicate/over-fulfilled orders) | `GET /api/v1/products` (scripted) + DB screenshot (manual) | partial — see below |
 
 Note: Bull-Board "Completed" reads 0 while `orders.service.ts` keeps `removeOnComplete: true`
-— see the queue-monitoring note below.
+— use the lifetime `orders_completed`/`orders_failed` counters instead, they don't decay.
 
 ## Correctness check after each run
 
+`remainingStock == 0` is checked automatically by `flash-sale.js` (`data_integrity_ok`
+threshold). The "no duplicate / no over-fulfilled order" half still needs a DB screenshot
+for the report — one query proves all three numbers at once:
+
 ```sql
-SELECT remaining_stock FROM products WHERE product_id = 'p-1001';        -- expect 0
-SELECT COUNT(*), COUNT(DISTINCT user_id) FROM orders WHERE product_id = 'p-1001';  -- expect 50 / 50
+SELECT remaining_stock FROM products WHERE product_id = 'p-1001';   -- expect 0, never negative
+
+SELECT COUNT(*)               AS total_orders,
+       COUNT(DISTINCT user_id) AS distinct_users,
+       MAX(cnt)                AS max_orders_per_user
+FROM (SELECT user_id, COUNT(*) AS cnt FROM orders WHERE product_id = 'p-1001' GROUP BY user_id) x;
+-- expect total_orders == distinct_users == 50 AND max_orders_per_user == 1
 ```
 
 ## Reset

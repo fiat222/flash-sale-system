@@ -3,7 +3,16 @@ import { getRepositoryToken } from '@nestjs/typeorm';
 import { Product } from '../database/entities/product.entity';
 import { REDIS_CLIENT } from '../redis/redis.provider';
 import { MetricsService } from '../metrics/metrics.service';
-import { ProductsService } from './products.service';
+import { ProductsService, ProductPage } from './products.service';
+
+const ROW = {
+  productId: 'p-1001',
+  name: 'Limited Edition Sneaker',
+  price: '2990.00',
+  availableStock: 50,
+  remainingStock: 50,
+  isFlashSaleActive: true,
+};
 
 describe('ProductsService', () => {
   let service: ProductsService;
@@ -12,31 +21,43 @@ describe('ProductsService', () => {
     get: jest.Mock;
     set: jest.Mock;
     mget: jest.Mock;
-    scan: jest.Mock;
-    del: jest.Mock;
     eval: jest.Mock;
+    sadd: jest.Mock;
+    smembers: jest.Mock;
+    unlink: jest.Mock;
   };
-  let repo: { findAndCount: jest.Mock };
+  let repo: { find: jest.Mock; count: jest.Mock };
 
   beforeEach(async () => {
     store = new Map();
+    const setKeys = new Set<string>();
     redis = {
-      get: jest.fn((k: string) => Promise.resolve(store.has(k) ? store.get(k) : null)),
+      get: jest.fn((k: string) => Promise.resolve(store.has(k) ? store.get(k)! : null)),
       // Mirrors ioredis: `SET k v ... NX` returns null when the key already exists.
       set: jest.fn((k: string, v: string, ...rest: unknown[]) => {
         if (rest.includes('NX') && store.has(k)) return Promise.resolve(null);
         store.set(k, v);
         return Promise.resolve('OK');
       }),
-      mget: jest.fn(),
-      scan: jest.fn(),
-      del: jest.fn(),
+      mget: jest.fn().mockResolvedValue([]),
       eval: jest.fn((_lua: string, _n: number, k: string) => {
         store.delete(k);
         return Promise.resolve(1);
       }),
+      sadd: jest.fn((_k: string, ...members: string[]) => {
+        members.forEach((m) => setKeys.add(m));
+        return Promise.resolve(members.length);
+      }),
+      smembers: jest.fn(() => Promise.resolve([...setKeys])),
+      unlink: jest.fn((...keys: string[]) => {
+        keys.forEach((k) => {
+          store.delete(k);
+          setKeys.delete(k);
+        });
+        return Promise.resolve(keys.length);
+      }),
     };
-    repo = { findAndCount: jest.fn() };
+    repo = { find: jest.fn(), count: jest.fn().mockResolvedValue(1) };
 
     const module = await Test.createTestingModule({
       providers: [
@@ -50,63 +71,68 @@ describe('ProductsService', () => {
     service = module.get(ProductsService);
   });
 
+  const parse = (raw: string) => JSON.parse(raw) as ProductPage;
+
   it('builds from Postgres on a cache miss and splices live remainingStock from Redis', async () => {
-    repo.findAndCount.mockResolvedValue([
-      [
-        {
-          productId: 'p-1001',
-          name: 'Limited Edition Sneaker',
-          price: '2990.00',
-          availableStock: 50,
-          remainingStock: 50,
-          isFlashSaleActive: true,
-        },
-      ],
-      1,
-    ]);
+    repo.find.mockResolvedValue([{ ...ROW }]);
     redis.mget.mockResolvedValue(['30']);
 
-    const body = await service.getPage(1, 10);
+    const body = parse(await service.getPageRaw(1, 10));
 
-    expect(repo.findAndCount).toHaveBeenCalledTimes(1);
+    expect(repo.find).toHaveBeenCalledTimes(1);
     expect(redis.mget).toHaveBeenCalledWith(['cache:stock:p-1001']);
     expect(body.data[0].remainingStock).toBe(30);
+    expect(body.data[0].productId).toBe('p-1001');
     expect(body.meta).toEqual({ total: 1, page: 1, limit: 10, totalPages: 1 });
-    // cached (serialised) under the page key with a jittered TTL (60-79s)
-    const pageSet = redis.set.mock.calls.find((c) => c[0] === 'cache:products:page:1:limit:10');
+
+    // template (not the stock) cached under the page key with a long jittered TTL
+    const pageSet = redis.set.mock.calls.find((c) => c[0] === 'cache:products:tpl:1:limit:10');
     expect(pageSet).toBeDefined();
-    expect(pageSet![1]).toEqual(expect.any(String));
     expect(pageSet![2]).toBe('EX');
-    expect(pageSet![3]).toBeGreaterThanOrEqual(60);
-    expect(pageSet![3]).toBeLessThan(80);
+    expect(pageSet![3]).toBeGreaterThanOrEqual(600);
+    expect(pageSet![3]).toBeLessThan(660);
+    // the cached blob carries no live stock value
+    expect(pageSet![1]).not.toContain('"remainingStock":30');
   });
 
-  it('serves a warm page from one Redis GET — no Postgres', async () => {
-    repo.findAndCount.mockResolvedValue([[], 0]);
-    redis.mget.mockResolvedValue([]);
+  it('falls back to the DB remainingStock when the live counter is cold', async () => {
+    repo.find.mockResolvedValue([{ ...ROW, remainingStock: 42 }]);
+    redis.mget.mockResolvedValue([null]);
 
-    await service.getPage(2, 10); // cold: build + cache
-    repo.findAndCount.mockClear();
-    await service.getPage(2, 10); // warm: GET hit
+    const body = parse(await service.getPageRaw(1, 10));
 
-    expect(repo.findAndCount).not.toHaveBeenCalled();
+    expect(body.data[0].remainingStock).toBe(42);
+  });
+
+  it('serves a warm page without touching Postgres, re-splicing stock each read', async () => {
+    repo.find.mockResolvedValue([{ ...ROW }]);
+
+    redis.mget.mockResolvedValue(['30']);
+    await service.getPageRaw(2, 10); // cold: build + cache template
+    repo.find.mockClear();
+
+    redis.mget.mockResolvedValue(['12']); // stock moved since the template was built
+    const body = parse(await service.getPageRaw(2, 10)); // warm: GET + MGET splice
+
+    expect(repo.find).not.toHaveBeenCalled();
+    expect(body.data[0].remainingStock).toBe(12);
   });
 
   it('single-flights a stampede of concurrent misses onto one Postgres build', async () => {
-    let resolveDb!: (v: [unknown[], number]) => void;
-    repo.findAndCount.mockReturnValue(new Promise((r) => (resolveDb = r)));
-    redis.mget.mockResolvedValue([]);
+    let resolveDb!: (v: unknown[]) => void;
+    repo.find.mockReturnValue(new Promise((r) => (resolveDb = r)));
+    redis.mget.mockResolvedValue(['30']);
 
-    const calls = [service.getPage(3, 10), service.getPage(3, 10), service.getPage(3, 10)];
-    resolveDb([[], 0]);
+    const calls = [service.getPageRaw(3, 10), service.getPageRaw(3, 10), service.getPageRaw(3, 10)];
+    resolveDb([{ ...ROW }]);
     await Promise.all(calls);
 
-    expect(repo.findAndCount).toHaveBeenCalledTimes(1); // not 3
+    expect(repo.find).toHaveBeenCalledTimes(1); // not 3
   });
 
-  it('L2: a waiter returns the page another instance publishes while holding the Redis lock', async () => {
-    repo.findAndCount.mockResolvedValue([[], 0]);
-    redis.mget.mockResolvedValue([]);
+  it('L2: a waiter returns the template another instance publishes while holding the lock', async () => {
+    repo.find.mockResolvedValue([{ ...ROW }]);
+    redis.mget.mockResolvedValue(['7']);
 
     // Simulate the cross-instance lock already being held elsewhere.
     redis.set.mockImplementation((k: string, v: string, ...rest: unknown[]) => {
@@ -115,26 +141,36 @@ describe('ProductsService', () => {
       return Promise.resolve('OK');
     });
 
-    const pending = service.getPage(9, 10);
-    // The other instance finishes its build and publishes the page.
-    store.set(
-      'cache:products:page:9:limit:10',
-      JSON.stringify({ status: 'success', data: [], meta: { total: 0, page: 9, limit: 10, totalPages: 0 } }),
-    );
+    const pending = service.getPageRaw(9, 10);
+    // The other instance finishes and publishes the template blob for this key.
+    const other = await service['buildBlob'](9, 10);
+    store.set('cache:products:tpl:9:limit:10', other);
 
-    const body = await pending;
+    const body = parse(await pending);
     expect(body.meta.page).toBe(9);
-    expect(repo.findAndCount).not.toHaveBeenCalled(); // the waiter never touched Postgres
+    // the waiter built the blob only via the simulation above, never through its
+    // own getPageRaw path beyond the one internal call
+    expect(repo.find).toHaveBeenCalledTimes(1);
   });
 
-  it('invalidate() SCANs and deletes every cached product page', async () => {
-    redis.scan
-      .mockResolvedValueOnce(['7', ['cache:products:page:1:limit:10']])
-      .mockResolvedValueOnce(['0', ['cache:products:page:2:limit:10']]);
+  it('invalidate() UNLINKs the tracked template keys, not a keyspace scan', async () => {
+    repo.find.mockResolvedValue([{ ...ROW }]);
+    redis.mget.mockResolvedValue(['30']);
+
+    await service.getPageRaw(1, 10);
+    await service.getPageRaw(2, 10);
+    expect(store.has('cache:products:tpl:1:limit:10')).toBe(true);
 
     await service.invalidate();
 
-    expect(redis.del).toHaveBeenCalledWith('cache:products:page:1:limit:10');
-    expect(redis.del).toHaveBeenCalledWith('cache:products:page:2:limit:10');
+    expect(redis.smembers).toHaveBeenCalledWith('cache:products:tplkeys');
+    expect(redis.unlink.mock.calls[0]).toEqual(
+      expect.arrayContaining([
+        'cache:products:tplkeys',
+        'cache:products:tpl:1:limit:10',
+        'cache:products:tpl:2:limit:10',
+      ]),
+    );
+    expect(store.has('cache:products:tpl:1:limit:10')).toBe(false);
   });
 });

@@ -1,4 +1,4 @@
-import { Inject, Logger } from '@nestjs/common';
+import { Inject, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { OnWorkerEvent, Processor, WorkerHost } from '@nestjs/bullmq';
 import { Job, UnrecoverableError } from 'bullmq';
 import { DataSource } from 'typeorm';
@@ -6,21 +6,37 @@ import Redis from 'ioredis';
 import { Product } from '../database/entities/product.entity';
 import { Order } from '../database/entities/order.entity';
 import { REDIS_CLIENT } from '../redis/redis.provider';
-import { ProductsService } from '../products/products.service';
 import { MetricsService } from '../metrics/metrics.service';
 import { OrderJobData } from '../orders/orders.service';
 
+// Key + cadence for the worker liveness heartbeat (Queue Monitoring: "worker
+// status" in the report). TTL > interval so a dead/stuck worker's heartbeat
+// naturally expires — no explicit down-marking needed.
+export const WORKER_HEARTBEAT_KEY = 'worker:heartbeat';
+const HEARTBEAT_INTERVAL_MS = 2000;
+const HEARTBEAT_TTL_SECONDS = 5;
+
 @Processor('orders', { concurrency: Number(process.env.WORKER_CONCURRENCY ?? 30) })
-export class OrderProcessor extends WorkerHost {
+export class OrderProcessor extends WorkerHost implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(OrderProcessor.name);
+  private heartbeatTimer?: NodeJS.Timeout;
 
   constructor(
     private readonly dataSource: DataSource,
     @Inject(REDIS_CLIENT) private readonly redis: Redis,
-    private readonly productsService: ProductsService,
     private readonly metrics: MetricsService,
   ) {
     super();
+  }
+
+  onModuleInit(): void {
+    const beat = () => void this.redis.set(WORKER_HEARTBEAT_KEY, Date.now(), 'EX', HEARTBEAT_TTL_SECONDS).catch(() => undefined);
+    beat();
+    this.heartbeatTimer = setInterval(beat, HEARTBEAT_INTERVAL_MS);
+  }
+
+  onModuleDestroy(): void {
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
   }
 
   // Lifetime queue totals for the report (spec 3, Queue Monitoring). Bull-Board
@@ -55,7 +71,9 @@ export class OrderProcessor extends WorkerHost {
       throw err;
     }
 
-    await this.productsService.invalidate();
+    // No cache invalidation: the product list caches only master data. The
+    // deducted remainingStock is spliced live from `cache:stock:*` on every
+    // read (already decremented at enqueue), so no cached template is stale.
   }
 
   // Compensation: only for jobs that exhausted retries on a transient failure.

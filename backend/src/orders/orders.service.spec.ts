@@ -2,7 +2,6 @@ import { ConflictException } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { getQueueToken } from '@nestjs/bullmq';
 import { REDIS_CLIENT } from '../redis/redis.provider';
-import { MetricsService } from '../metrics/metrics.service';
 import { OrdersService } from './orders.service';
 
 describe('OrdersService', () => {
@@ -21,7 +20,6 @@ describe('OrdersService', () => {
         OrdersService,
         { provide: REDIS_CLIENT, useValue: redis },
         { provide: getQueueToken('orders'), useValue: queue },
-        { provide: MetricsService, useValue: { increment: jest.fn() } },
       ],
     }).compile();
 

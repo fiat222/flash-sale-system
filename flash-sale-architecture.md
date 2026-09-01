@@ -1,172 +1,271 @@
-# Flash Sale System — Architecture & Design Rationale (v2)
+# Flash Sale System — Architecture and Current Implementation
 
-เอกสารออกแบบระบบสำหรับ Final Assignment (mobile 240-331)
-เวอร์ชันปรับปรุงจากการวิเคราะห์ scale จริง (500 users) เทียบกับทรัพยากรเครื่องจริง (4 vCPU / 6GB RAM)
-เปลี่ยนจาก v1 หลัก: **รวม Redis เหลือ 1 instance** (จากเดิมแยก cache/queue) เพราะที่ scale นี้การแยกเป็น over-engineering ที่แลกด้วย resource และเวลาโดยไม่ได้ throughput เพิ่มจริง
+เอกสารนี้อัปเดตตรงกับระบบที่อยู่ใน repo ปัจจุบัน โดยยึดตามโค้ดจริงใน `backend/src` และ `deploy/docker-compose.yml` ไม่ใช่ design แบบแนวคิดเก่าที่ยังค้างอยู่ในสเปก
 
 ---
 
-## 0. หลักคิดที่ใช้ตัดสินใจทุกอย่างในเอกสารนี้
+## 1. ภาพรวมระบบ
 
-### 0.1 คะแนนอยู่ตรงไหน
+ระบบนี้ถูกออกแบบให้ใช้ 1 Redis instance, 1 Postgres instance, Nginx reverse proxy, 6 API instances และ 1 worker process แยกออกจาก HTTP API เพื่อให้การจัดการ write burst และ queue processing ไม่รบกวน hot path ของ request
 
-| ส่วน | ให้คะแนน performance? | กลยุทธ์ |
-|---|---|---|
-| `POST /auth/token` | ไม่ | แค่ต้องไม่ล้มที่ 500 users |
-| `GET /products` | **ใช่ (หนักสุด)** | ต้องไม่แตะ Postgres เลยใน steady state |
-| `POST /orders` | **ใช่ + ตรวจความถูกต้อง** | ต้อง reject ให้เร็ว และ commit ให้ถูกต้อง 100% |
+สถาปัตยกรรมหลัก:
 
-### 0.2 หลักคิดที่แก้จาก v1: อย่า over-engineer เกิน scale ที่ต้องรองรับ
+- `nginx` เป็น edge reverse proxy / load balancer
+- `api1`–`api6` รัน NestJS ด้วย Fastify
+- `worker` รัน NestJS ใน mode `ROLE=worker` เพื่อประมวลผล BullMQ jobs
+- `postgres` เป็น source of truth สำหรับ product และ order
+- `redis` ใช้สำหรับ cache-aside, temporary reservation, metrics, และ BullMQ state
+- `migrate` เป็น one-shot migration + seed
 
-v1 แยก Redis เป็น cache/queue สองตัวด้วยเหตุผลกลัว event-loop contention ระหว่างสอง workload — เหตุผลนี้ถูกต้องในทางทฤษฎีแต่ **ผิดขนาด** สำหรับงานนี้ Redis เดี่ยวทำ simple command ได้ระดับแสนครั้งต่อวินาที ขณะที่ระบบทั้งหมดมี load รวมหลักพันครั้งต่อวินาทีที่ peak (1,000 concurrent read + 500 concurrent write) ห่างจากจุดที่ contention จะเริ่มมีผลเป็นระดับความจริงจังคนละขนาด
+ประเด็นสำคัญที่ทำให้ระบบนี้ต่างจาก design แบบเดิมคือ:
 
-บนเครื่อง 4 vCPU / 6GB การแยก container เพิ่มมี **ต้นทุนจริงที่จับต้องได้**: baseline RAM ต่อ container, จุด debug เพิ่ม, ความเสี่ยง OOM-kill เพิ่มตามสัดส่วนจำนวน service — ขณะที่ประโยชน์ที่ได้กลับมาแทบวัดไม่ออกที่ scale นี้ resource ที่ประหยัดได้จากการรวมเอาไปเพิ่มให้ Postgres (จุดที่ CPU-sensitive จริง) และเผื่อ headroom กัน crash กลาง demo มีประโยชน์กว่ามาก
-
-**หลักที่ใช้ทั่วทั้งเอกสาร:** ทุก component ที่เพิ่มเข้าไปต้องตอบได้ว่า "ที่ 500 users บนเครื่องนี้ มันแก้ปัญหาอะไรที่วัดผลได้จริง" ถ้าตอบไม่ได้ให้ตัดออก
-
-### 0.3 อีกเหตุผลที่สำคัญไม่แพ้กัน: อาจารย์ตรวจ NestJS มากกว่า infra
-
-วิชานี้คือ backend/NestJS บทเรียน 01-06 เน้นย้ำเรื่อง Module/Controller/Service, DI, DTO validation, transaction, locking, queue processor ตลอด — นี่คือของที่ให้คะแนนจริง ส่วนจำนวน container ใน `docker-compose.yml` ไม่ใช่หัวข้อในบทไหนเลย
-
-ดังนั้นเอกสารนี้จงใจ **ลดความซับซ้อนของ infra ให้เหลือน้อยที่สุดเท่าที่ยังถูกต้อง** เพื่อเอาเวลาไปลงกับคุณภาพโค้ด NestJS แทน — unit test ที่ mock ถูกต้อง, exception handling ที่ครบ (23505/40P01 ตามบทที่ 03), DTO validation ที่รัดกุม, DI ที่ swap ได้จริงตามแนวทางบทที่ 02
+- product page cache ใช้ template cache + live stock splice จาก Redis
+- cache miss ถูก coalesce ด้วย Redis lock และ in-process single-flight
+- ไม่มี response cache ทั้งหน้าแบบ TTL ข้าม request
+- write path ใช้ Lua reservation + BullMQ worker + compensation on retry exhaustion
+- `cache:stock:*` เป็น real-time source สำหรับ `remainingStock` ไม่ได้ invalidates ทุกครั้ง
 
 ---
 
-## 1. องค์ประกอบระบบ และเหตุผลของแต่ละตัว
+## 2. Runtime topology
 
-### 1.1 Nginx — Load Balancer
+### 2.1 Nginx
 
-**เทคนิคที่ใช้และเหตุผล:**
+`nginx` อยู่ก่อน API และทำหน้าที่ round-robin ไปยัง 6 api instances โดยไม่ใช้ edge cache
 
-```nginx
-upstream api {
-    least_conn;
-    server api1:3000 max_fails=3 fail_timeout=10s;
-    server api2:3000 max_fails=3 fail_timeout=10s;
-    server api3:3000 max_fails=3 fail_timeout=10s;
-    keepalive 128;
+ข้อสังเกตจาก config ปัจจุบัน:
+
+- `nginx.conf` ทำ static upstream pool ไปยัง `api1` ถึง `api6`
+- `keepalive` และ `proxy_http_version 1.1` ถูกตั้งไว้เพื่อลด socket churn
+- access log ถูกปิด/จำกัดเพื่อลด I/O ใน hot path
+- worker ก็ถูก proxy ผ่าน nginx ที่ `/admin/queues` เพื่อไม่ให้ dashboard รบกวน API process
+
+### 2.2 NestJS + Fastify
+
+API instances ถูกสร้างด้วย:
+
+```ts
+const app = await NestFactory.create<NestFastifyApplication>(
+  AppModule,
+  new FastifyAdapter({ logger: false, disableRequestLogging: true }),
+);
+```
+
+และมี global ValidationPipe:
+
+```ts
+const validationPipe = new ValidationPipe({
+  whitelist: true,
+  forbidNonWhitelisted: true,
+  transform: true,
+});
+```
+
+สิ่งที่เป็นจริงในโค้ดตอนนี้:
+
+- ใช้ Fastify แทน Express
+- `POST /orders` และ `/auth/token` ยังใช้ DTO validation ผ่าน ValidationPipe
+- `GET /products` ไม่ใช้ reflection-heavy validation แบบ naive แต่จัดการ `page` / `limit` ใน service เอง
+- ไม่มี Passport JWT layer; ใช้ custom guard ที่เรียก `jwt.verify()` โดยตรง
+- logger ถูกปิดบน hot path เพื่อให้ throughput ดีขึ้น
+
+### 2.3 Worker model
+
+Worker เริ่มจาก `ROLE=worker` และ mount Bull-Board สำหรับ queue dashboard:
+
+```ts
+if (role === 'worker') {
+  const queue = app.get<Queue>(getQueueToken('orders'));
+  await mountBullBoard(...);
+  await app.listen(port, '0.0.0.0');
 }
-server {
-    listen 80;
-    access_log off;
-    location / {
-        proxy_pass http://api;
-        proxy_http_version 1.1;
-        proxy_set_header Connection "";
-    }
+```
+
+Worker รันแยกจาก API เหตุผลว่า:
+
+- Node.js เป็น single-threaded
+- processing job ที่ทำ DB transaction + lock จะ block event loop หากอยู่ใน same process
+- queue worker อาจทำงานทับกับ request load ได้จริง จึงแยก container ออกมา
+
+---
+
+## 3. Product read path
+
+### 3.1 รูปแบบ cache ที่ใช้จริง
+
+Read path ไม่ใช่ “cache page ทั้งก้อนแล้วลบทุกครั้ง” แบบเก่า แต่เป็น template cache ที่คั่นระหว่างข้อมูลที่เปลี่ยนช้าและข้อมูลที่เปลี่ยนเร็ว:
+
+- ข้อมูลที่แทบไม่เปลี่ยน: `productId`, `name`, `price`, `availableStock`, `isFlashSaleActive`
+- ข้อมูลที่เปลี่ยนตลอด: `remainingStock`
+
+โค้ดใช้ key แบบนี้:
+
+```ts
+const TPL_KEY = (page: number, limit: number) => `cache:products:tpl:${page}:limit:${limit}`;
+const TPLKEYS_SET = 'cache:products:tplkeys';
+```
+
+`buildBlob()` สร้าง template JSON แล้วแทน `remainingStock` ด้วย placeholder เช่น `@@RS0@@` เพื่อให้ render phase ใส่ stock จริงจาก Redis ในทุก request
+
+### 3.2 Single-flight และ lock
+
+สำหรับ hot path ที่มีการ miss เดียวกันจากหลาย instance โค้ดใช้:
+
+- in-process `Map<string, Promise<string>>` สำหรับ single-flight ใน instance เดียว
+- Redis lock `lock:${pageKey}` ภายใน `buildCoalesced()`
+- TTL 5s และ polling timeout 3s
+
+เหตุผลคือ:
+
+- Nginx round-robin ทำให้ multi-instance miss เกิดพร้อมกัน
+- `Map` อย่างเดียวไม่เพียงพอ เพราะหลาย instance จะ build ซ้ำ
+- Redis lock รวมการ build ให้เป็น 1 build ต่อ page template ภายใน cluster
+
+### 3.3 Render path
+
+`render()` ทำงานแบบนี้:
+
+```ts
+const stocks = await this.redis.mget(ids.map((id) => `cache:stock:${id}`));
+let out = segments[0];
+for (let i = 0; i < ids.length; i++) {
+  out += (stocks[i] != null ? stocks[i] : dbStock[i]) + segments[i + 1];
 }
+return out;
 ```
 
-- `keepalive 128` + `proxy_http_version 1.1` + `Connection ""` — ป้องกัน Nginx เปิด TCP connection ใหม่ไปหา backend ทุก request ถ้าไม่ใส่ ตอนยิง 1,000 concurrent จะเจอ TIME_WAIT socket เต็มและ p95 พุ่ง
-- `access_log off` — ตัด disk I/O ที่ไม่มีใครอ่านออกจาก hot path
-- `least_conn` ไม่ใช้ `ip_hash` — k6 ยิงจาก IP เดียว ip_hash จะกองลง instance เดียวหมด
+จึงมีคุณสมบัติเหล่านี้:
 
-### 1.2 NestJS + Fastify — Backend (3 instances)
+- ไม่มี `JSON.parse` บน hot path
+- ไม่มี object creation สำหรับ response ทั้งก้อน
+- stock วางสดทุก request จาก `cache:stock:*`
+- cache stampede ที่เกิดจาก invalidation แบบ cache page ทั้งหน้า ไม่เกิดใน path นี้
 
-**เทคนิคที่ใช้และเหตุผล:**
+### 3.4 Invalidate logic
 
-- **`FastifyAdapter` แทน Express** — เปลี่ยนแค่บรรทัดเดียวใน `main.ts` โครงสร้าง module/controller/service เหมือนเดิมทุกอย่าง ไม่กระทบคะแนนส่วน architecture แต่ได้ JSON serializer ที่เร็วกว่า
-- **ปิด global `ValidationPipe` บน `GET /products`** — parse `page`/`limit` เองแทน `class-validator` reflection ที่แพงเกินความจำเป็นสำหรับงานง่ายขนาดนี้ ยังเปิด ValidationPipe ไว้กับ `POST /orders` และ `/auth/token` เพื่อคงคะแนนส่วน DTO validation
-- **ไม่ใช้ Passport สำหรับ JWT** — เขียน `JwtGuard` เองที่เรียก `jwt.verify()` ตรงๆ เบากว่า Passport strategy layer
-- **ปิด Nest Logger บน hot path** — log level `warn` ตอน production
+`invalidate()` ทำเพียง:
 
-### 1.3 Worker — แยก container ออกจาก API (ยืนยันเหมือน v1)
+```ts
+const keys = await this.redis.smembers(TPLKEYS_SET);
+await this.redis.unlink(TPLKEYS_SET, ...keys);
+```
 
-**ยังคงแยกเพราะเหตุผลนี้จำเป็นจริง ไม่ใช่ over-engineering:** ถ้ารัน BullMQ processor อยู่ในโปรเซสเดียวกับ API instance มันจะแย่ event loop จาก request handler ตอนที่ k6 ยิงหนักที่สุด — ต่างจากการแยก Redis ตรงที่ Node.js เป็น single-threaded จริง งานประมวลผล job (เปิด transaction, รอ lock) เป็นงานที่ block event loop ได้จริง ไม่ใช่แค่ I/O เบาๆ แบบ Redis command
+หมายความว่า:
 
-รันเป็น service แยกใน `docker-compose.yml` (image เดียวกับ API แต่ bootstrap คนละ mode ผ่าน `ROLE=worker`) — API instance ทำหน้าที่แค่ enqueue เท่านั้น
-
-### 1.4 Redis — 1 instance, แยกด้วย key namespace (เปลี่ยนจาก v1)
-
-**เทคนิคที่ใช้และเหตุผล:**
-
-รวม cache กับ queue ไว้ใน Redis ตัวเดียว แยกโซนด้วย key prefix แทนการแยก container:
-
-| Namespace | ใช้ทำอะไร |
-|---|---|
-| `cache:template:{page}:{limit}` | response template ที่ serialize ไว้แล้ว |
-| `cache:stock:{productId}` | สต็อกคงเหลือแบบ real-time |
-| `cache:claim:{productId}` | userId ที่จองสิทธิ์ไปแล้ว |
-| `bull:*` | BullMQ ใช้ prefix นี้แยกโซนให้อัตโนมัติผ่าน `queuePrefix` config |
-
-**ทำไมถึงรวม (ต่างจาก v1):**
-- Load รวมของทั้งระบบอยู่ระดับหลักพัน ops/วินาทีที่ peak ห่างจากจุดที่ single-thread contention จะเริ่มมีผลมาก
-- ประหยัด baseline RAM ~50-80MB และลดจุด debug ลง 1 container บนเครื่องที่ RAM ทุก MB มีความหมาย
-- โค้ด application (Lua script, cache-aside, invalidation) เหมือนเดิมทุกบรรทัด ไม่ต้องแก้ business logic ใดๆ
-
-**สิ่งที่ต้องเผื่อจากการรวม:** เปิด persistence ไว้ทั้งก้อน (เพราะ queue data อยู่ตัวเดียวกับ cache แล้ว ต่างจาก v1 ที่ปิด persistence ฝั่ง cache ได้) — เป็น trade-off เดียวที่เสียไป ไม่กระทบ correctness หรือ performance ที่ scale นี้
-
-**`enableAutoPipelining: true`** ใน ioredis client — เปิดไว้เพื่อรวบคำสั่งที่เกิดในเวลาไล่เลี่ยกันส่งเป็นชุดเดียว มีผลตอน 1,000 concurrent
-
-**เมื่อไหร่ถึงควรแยกจริง (บันทึกไว้เป็น documented trade-off):** ถ้า concurrent users ขึ้นถึงหลักหมื่น หรือ queue มี job หนักระดับ ETL/batch ไม่ใช่ fire-and-forget เล็กๆ แบบนี้ ตอนนั้นการแยกจะเริ่มให้ประโยชน์วัดผลได้จริง
-
-### 1.5 PostgreSQL + TypeORM
-
-**เทคนิคที่ใช้และเหตุผล:**
-
-- **`SELECT ... FOR UPDATE` (pessimistic lock)** ไม่ใช้ optimistic — เหตุผลผูกกับ contention pattern ของระบบนี้โดยตรง: ทุก job ที่มาถึง worker แย่ row เดียวกัน (`p-1001`) ถ้าใช้ optimistic lock (`@VersionColumn` + retry) ยิ่ง concurrent สูงยิ่ง retry ถี่ ระบบเข้าสู่ thrashing (เสีย CPU กับงานที่ถูกทิ้ง) ส่วน pessimistic ทำให้ transaction ที่มาทีหลังแค่รอในคิวเรียบร้อย ไม่มี retry ไม่มี CPU เสียเปล่า และเพราะ Lua script ที่ Redis กรองจาก 500 requests เหลือแค่ ~50 ที่มาถึง worker จริง contention จริงจึงต่ำ pessimistic lock จึงไม่แพงในระบบนี้
-- **`UNIQUE (user_id, product_id)`** — ตาข่ายชั้นสุดท้าย ในทางปฏิบัติไม่ถูกกระตุ้นเลยเพราะ Redis กันไปแล้ว แต่ต้องมีเพื่อพิสูจน์ว่าถูกต้องแม้ Redis พัง
-- **`CHECK (remaining_stock >= 0)`** — บังคับที่ระดับ schema
-- **Connection pool เล็ก** — read path ไม่แตะ DB เลย: `3 API × pool 5 + worker × pool 10 = 35` < `max_connections=60` ที่ตั้งไว้ (ดูหัวข้อ 1.7)
-- **ไม่ทำ read replica** — read ไม่แตะ DB เลยในระบบนี้ replica จะไม่มีงานทำ เพิ่มความซับซ้อนโดยไม่ได้อะไร (ต่างจากบทที่ 06 ที่ไม่มี cache layer กั้น replica จึงช่วยได้จริง)
-
-### 1.6 JWT — Stateless Authentication
-
-- **HS256** ไม่ใช่ RS256 — symmetric key เร็วกว่าในการ verify และไม่มี third party ต้อง verify ด้วย public key
-- **payload เล็กที่สุด** — แค่ `{ sub: userId }` + `exp`
-- **Verify-cache ด้วย Map** — user บางคนยิงซ้ำ 2-3 ครั้งด้วย token เดิม ใช้ LRU Map เก็บ `token → userId` (TTL สั้น) ตัด HMAC ซ้ำออกจาก request ที่ 2 เป็นต้นไป
-- **ไม่มี DB lookup ใน guard** — `/auth/token` แค่ sign token คืนไปเลย
-
-### 1.7 Observability
-
-- **Bull-Board** mount ที่ worker container ไม่ใช่ API เพื่อไม่ให้ dashboard ที่ poll ตลอดเวลารบกวน instance ที่ถูกวัดคะแนน
-- **`GET /api/v1/_metrics`** — สรุป cache hit/miss, orders accepted/duplicate/soldout, queue depth
-- **นับ metric ใน memory แล้ว flush ขึ้น Redis ทุก 1 วินาที** — ไม่ `INCR` ไป Redis ทุก request เพราะเป็นการเพิ่ม round trip เข้าไปในเส้นทางที่กำลังพยายามลด round trip
+- ไม่ใช่ `DEL cache:template:*` แบบ broad scan
+- ใช้ tracked set เพื่อให้ลบเฉพาะ template ที่เคยถูกสร้างจริง
+- master data เช่น name/price/flag ถูก invalidate แบบ batch ใน Redis
+- `remainingStock` ไม่ใช่ส่วนของ template จึงไม่ควร invalidates ทุกครั้ง
 
 ---
 
-## 2. Resource Budget (4 vCPU / 6GB RAM)
+## 4. Write path
 
-| Service | CPU | RAM |
+### 4.1 Lua reservation
+
+โค้ดใน `orders.service.ts` ใช้ ioredis custom command `claimStock` พร้อม Lua script จาก `backend/src/orders/lua/claim-stock.lua`:
+
+```lua
+if redis.call('SADD', KEYS[1], ARGV[1]) == 0 then
+  return -1
+end
+local left = redis.call('DECR', KEYS[2])
+if left < 0 then
+  redis.call('INCR', KEYS[2])
+  redis.call('SREM', KEYS[1], ARGV[1])
+  return -2
+end
+return left
+```
+
+หลักการทำงาน:
+
+- `cache:claim:{productId}` เป็น set ของ user ที่เคย claim แล้ว
+- `cache:stock:{productId}` เป็น remaining stock แบบ real-time
+- `SADD` ตรวจ duplicate แบบ atomic
+- `DECR` ลด stock แบบ atomic
+- ค่าที่คืนกลับคือ `-1` = duplicate, `-2` = sold out, ตัวเลขอื่น = success
+
+### 4.2 Queue enqueue behavior
+
+เมื่อ claim success แล้ว ระบบจะ enqueue job ด้วย deterministic ID:
+
+```ts
+jobId: `${userId}|${productId}`
+```
+
+และตั้งค่า:
+
+```ts
+removeOnComplete: { count: 100 },
+removeOnFail: { count: 100 },
+attempts: 3,
+backoff: { type: 'exponential', delay: 200 },
+```
+
+หมายถึง:
+
+- duplicate request จะถูก reject ที่ Redis ก่อนถึง queue
+- queue มองเห็นเฉพาะ request ที่จริง ๆ ผ่านการ claim
+- Bull-Board จะแสดงจำนวนที่เหลือเพียง N job ล่าสุด
+
+### 4.3 Worker transaction
+
+Worker ใช้ pessimistic lock ใน `Product` row:
+
+```ts
+await this.dataSource.transaction(async (manager) => {
+  const product = await manager.findOne(Product, {
+    where: { productId },
+    lock: { mode: 'pessimistic_write' },
+  });
+  if (!product || product.remainingStock < 1) {
+    throw new UnrecoverableError('sold out');
+  }
+  product.remainingStock -= 1;
+  await manager.save(product);
+  await manager.save(manager.create(Order, { userId, productId }));
+});
+```
+
+ถ้า DB เกิด duplicate / constraint violation จะ throw `UnrecoverableError` เพื่อไม่ retry
+
+### 4.4 Compensation
+
+ใน `@OnWorkerEvent('failed')`:
+
+- ถ้า job หมด retry และยังเป็น transient failure → `cache:stock:{productId}` + 1 และ `SREM cache:claim:{productId}`
+- ถ้า error เป็น `UnrecoverableError` (sold out / duplicate) → ไม่คืนสต็อกเพราะการจองมันเป็น final
+
+นี้ตรงกับความจริงของ system: Redis จัดการ reservation, Postgres จัดการ confirmation, และ compensation ควรทำเฉพาะกรณีที่ job ล้มแบบ transient
+
+---
+
+## 5. Redis key layout
+
+Key ที่ใช้อย่างเป็นทางการใน repo:
+
+| Key pattern | Type | Purpose |
 |---|---|---|
-| `nginx` | 0.25 | 64MB |
-| `api1` `api2` `api3` | 0.65 ต่อตัว | 350MB ต่อตัว |
-| `worker` | 0.5 | 300MB |
-| `postgres` | 1.0 | 900MB |
-| `redis` | 0.4 | 350MB |
-| **รวม** | **~4.05** | **~2.75GB** |
+| `cache:stock:{productId}` | String | Remaining stock real-time |
+| `cache:claim:{productId}` | Set | User IDs already claimed |
+| `cache:products:tpl:{page}:limit:{limit}` | String | Product page template blob |
+| `cache:products:tplkeys` | Set | Tracked template keys for invalidation |
+| `cache:m:{metric}` | String | Metrics counters |
+| `lock:{pageKey}` | String | Redis mutex for template build |
+| `bull:*` | mixed | BullMQ internal state |
 
-เหลือ RAM ~3.25GB ให้ host OS และกันสำรองตอน spike — ถ้า container ถูก OOM-kill กลาง load test ผลทดสอบทั้งชุดพังทันที เป็นความเสี่ยงที่สำคัญกว่าเรื่อง throughput ไม่พอ
+หมายเหตุสำคัญ:
 
-**ป้องกัน OOM ระหว่างยิง:**
-
-```yaml
-api1:
-  environment:
-    NODE_OPTIONS: "--max-old-space-size=220"
-  deploy:
-    resources:
-      limits:
-        cpus: "0.65"
-        memory: 350M
-```
-
-`max-old-space-size` ตั้งไว้ที่ ~60-65% ของ `mem_limit` เพื่อเผื่อ native buffer/stack นอก heap
-
-**Postgres ต้องตั้งเองเพราะไม่รู้จัก cgroup limit อัตโนมัติ:**
-```
--c shared_buffers=192MB
--c max_connections=60
--c work_mem=4MB
-```
-
-**เครื่อง Host:** แนะนำ Debian (netinst, ไม่ใช่ desktop) เพราะ baseline RAM เบากว่า Ubuntu Server อย่างชัดเจน (~80-150MB vs ~250-400MB เพราะ snapd/cloud-init) ที่ scale นี้ RAM ทุก MB มีความหมาย ถ้าทีมถนัด Ubuntu อยู่แล้วให้ปิด snapd และล้าง cloud-init ทิ้งตอน provision
+- `seed.ts` ใช้ `SET ... NX` เพื่อไม่ให้ seed overwrite stock ที่มีอยู่แล้ว
+- Redis มี `enableAutoPipelining: true` ใน provider
+- metric ใช้ `MGET` แบบ fixed key list เพื่อหลีกเลี่ยง `KEYS cache:m:*` ที่ block Redis single-thread
 
 ---
 
-## 3. Data Model
+## 6. PostgreSQL schema
 
-### 3.1 PostgreSQL
+Schema ปัจจุบันมีพื้นฐานดังนี้:
 
 ```sql
 CREATE TABLE products (
@@ -188,230 +287,129 @@ CREATE TABLE orders (
 );
 ```
 
-**หมายเหตุเรื่อง seed:** `products-seed.json` ไม่มีฟิลด์ `remainingStock` — ตอน seed ให้ตั้ง `remaining_stock = available_stock` เพราะ flash sale ยังไม่เริ่ม `available_stock` = โควตาที่จัดสรรไว้ (คงที่), `remaining_stock` = เหลือเท่าไหร่ (ลดลงเรื่อยๆ)
+สิ่งที่ชัดเจนคือ:
 
-### 3.2 Redis keys (namespace เดียวกันหมด ตัวเดียว)
-
-| Key | Type | ใช้ทำอะไร |
-|---|---|---|
-| `cache:stock:{productId}` | String (int) | สต็อกคงเหลือแบบ real-time |
-| `cache:claim:{productId}` | Set | userId ที่จองสิทธิ์ไปแล้ว |
-| `cache:template:{page}:{limit}` | String | response template ที่ serialize ไว้แล้ว |
-| `cache:m:*` | String (int) | metrics counter |
-| `bull:*` | mixed | BullMQ internal state |
-
-**การ seed `cache:stock:*` ต้องใช้ `SET NX`** ไม่ใช่ `SET` ธรรมดา — ถ้า API instance restart กลางการทดสอบแล้ว seed ทับ สต็อกจะเด้งกลับเป็น 50 และผลทดสอบจะพัง
+- `UNIQUE (user_id, product_id)` ทำหน้าที่ defense-in-depth
+- `remaining_stock >= 0` ถูกบังคับที่ database level
+- read path ส่วนใหญ่ไม่ต้องติดต่อ DB ถึง steady-state
+- worker ใช้ `pessimistic_write` lock ใน transaction ที่อ่าน product แล้วค่อย decrement
 
 ---
 
-## 4. Read Path — `GET /api/v1/products`
+## 7. JWT and auth
 
-### 4.1 ปัญหาที่ต้องแก้
+`auth.service.ts` และ `jwt.guard.ts` ใช้ JWT แบบ stateless:
 
-โจทย์วางกับดักไว้ตรงที่ต้อง cache เพื่อความเร็ว แต่ `remainingStock` ต้องถูกต้องเสมอ วิธี naive คือ cache ทั้งหน้าแล้วลบ cache ทุกครั้งที่สต็อกเปลี่ยน — จะพังเพราะระหว่างที่ 1,000 VU กำลังยิงอยู่ ทุกครั้งที่ worker ตัดสต็อก cache จะหาย แล้ว request หลายร้อยตัวจะวิ่งเข้า Postgres พร้อมกัน (**cache stampede**) เกิดขึ้น 50 ครั้งตลอดการทดสอบ
+- algorithm: `HS256`
+- verify ผ่าน `jwt.verify(token, secret, { algorithms: ['HS256'] })`
+- payload เล็ก: `{ sub: userId }` + `exp`
+- ไม่มี DB lookup ใน guard
 
-### 4.2 ทางแก้: แยก cache ตามอัตราการเปลี่ยนแปลง
-
-- **แทบไม่เปลี่ยน:** `productId`, `name`, `price`, `availableStock`, `isFlashSaleActive` — เก็บเป็น response template ที่ pre-split เป็นชิ้นๆ ตรงตำแหน่งที่ตัวเลขสต็อกต้องไปวาง
-- **เปลี่ยนตลอดเวลา:** `remainingStock` — อ่านจาก `cache:stock:*` ด้วย `MGET` ทุก request ไม่มีวัน stale
-
-```ts
-type PageTemplate = { segments: string[]; ids: string[] };
-
-const stocks = await redis.mget(tpl.ids.map(id => `cache:stock:${id}`));
-let out = tpl.segments[0];
-for (let i = 0; i < stocks.length; i++) out += stocks[i] + tpl.segments[i + 1];
-return out;  // ส่งเป็น string ตรงๆ ไม่ต้อง serialize
-```
-
-**ทำไมถึงเร็ว:** ไม่มี `JSON.parse`/`JSON.stringify` บน response path (แค่ต่อ string จาก segments), Redis สองครั้ง (`GET` template + `MGET` stock) ต่อ request ไม่แตะ Postgres, สต็อกไม่เคยอยู่ใน template cache — spliced สดทุกครั้ง ไม่มี cache stampede เชิงโครงสร้าง
-
-### 4.3 Cache tier — Redis เท่านั้น (ไม่มี in-process cache)
-
-กฎ requirement: **ห้ามใช้ in-memory-caching**. template (`segments`/`ids`) เก็บใน Redis key `cache:template:{page}:{limit}` อย่างเดียว — ทุก request ที่ hit = Redis `GET` (template) + `MGET` (stock) สอง round trip, ไม่แตะ Postgres
-
-ผลพลอยได้ที่สำคัญ: `invalidateTemplates()` ของ worker = `DEL cache:template:*` ครั้งเดียว → **ทุก api instance เห็น miss พร้อมกันทันที** ไม่มี copy per-instance ให้ค้าง stale (ตรงเงื่อนไข spec 2.2 "คืน remainingStock ที่ถูกต้องเสมอ" + "invalidate ทันที")
-
-**ไม่ทำ:** cache response string ทั้งก้อนแบบมี TTL — สต็อกจะ stale ได้ในช่วง TTL ก่อน invalidate เสร็จ ขัดกฎ
-
-### 4.4 Pagination และการป้องกัน input มั่ว
-
-```ts
-const page  = Math.max(1, parseInt(q.page)  || 1);
-const limit = Math.min(100, Math.max(1, parseInt(q.limit) || 10));
-```
-
-- `limit=abc`, `page=-5` → fallback เป็น default ไม่ใช่ 500
-- `page=99999` → ตอบ 200 พร้อม `data: []`
-- **clamp `limit` ที่ 100** กัน cache key explosion
-- `meta.totalPages = Math.ceil(20 / limit)` ต้องตรงเป๊ะ เพราะสคริปต์กลุ่มอื่นน่าจะ `check()` ตรงนี้
-
-### 4.5 Warm-up
-
-ตอน bootstrap prebuild template ของชุด `(page, limit)` ที่น่าจะถูกยิงบ่อย เพื่อไม่ให้เจอ cold miss ตอน k6 เริ่มยิง
+สิ่งนี้เข้ากับ requirements ของระบบที่ต้องรับ request ต่อเนื่องโดยไม่ทำ database lookup เพิ่มเติม
 
 ---
 
-## 5. Write Path — `POST /api/v1/orders`
+## 8. Metrics and observability
 
-### 5.1 Lua script เดียวที่ atomic
+`MetricsService` เก็บ counter ใน Redis แบบ fixed set:
 
-```lua
--- KEYS[1] = cache:claim:{productId}   ARGV[1] = userId
--- KEYS[2] = cache:stock:{productId}
-if redis.call('SADD', KEYS[1], ARGV[1]) == 0 then
-  return -1                                    -- ซื้อซ้ำ
-end
-local left = redis.call('DECR', KEYS[2])
-if left < 0 then
-  redis.call('INCR', KEYS[2])
-  redis.call('SREM', KEYS[1], ARGV[1])         -- คืนสิทธิ์ให้ตัวเอง
-  return -2                                    -- ของหมด
-end
-return left                                    -- สำเร็จ
-```
+- `cache_hit`
+- `cache_miss`
+- `cache_wait_hit`
+- `cache_wait_timeout`
+- `db_build`
+- `orders_accepted`
+- `orders_duplicate`
+- `orders_soldout`
+- `orders_completed`
+- `orders_failed`
 
-**ทำไมออกแบบแบบนี้:** 1 round trip ได้ทั้ง duplicate check และ stock reservation, atomic จริง, `SADD` ก่อน `DECR` เสมอ (ถ้าสลับ user ที่ยิงซ้ำจะแย่งสต็อกจากคนอื่นก่อนแล้วค่อยรู้ตัวว่าซื้อซ้ำ) และ `SADD` ทำหน้าที่เป็น idempotency key ในตัว ไม่ต้องมี `SETNX` lock แยกที่มีปัญหา TTL หมดอายุกลางคัน
+รูปแบบ snapshot:
 
-### 5.2 ผลลัพธ์ของดีไซน์นี้
-
-จาก 500+ requests เหลือแค่ **50 job** ที่เข้าคิว ที่เหลือถูกปฏิเสธที่ Redis ภายในไม่กี่ไมโครวินาที → Postgres เห็นแค่ 50 transaction, contention บน row `p-1001` แทบไม่มี → ใช้ pessimistic lock ได้อย่างสบายใจ
-
-### 5.3 การ enqueue
-
-```ts
-await queue.add('deduct', { userId, productId }, {
-  jobId: `${userId}:${productId}`,   // deterministic → BullMQ กันซ้ำอีกชั้น
-  removeOnComplete: true,
-  removeOnFail: 1000,
-  attempts: 3,
-  backoff: { type: 'exponential', delay: 200 },
-});
-```
-
-ตอบ `202` ทันทีหลัง `add()` return — ห้ามรอผล job
-
-### 5.4 Worker
-
-```ts
-await dataSource.transaction(async (m) => {
-  const p = await m.findOne(Product, {
-    where: { productId },
-    lock: { mode: 'pessimistic_write' },
-  });
-  if (p.remainingStock < 1) throw new UnrecoverableError('sold out');
-  p.remainingStock -= 1;
-  await m.save(p);
-  await m.save(m.create(Order, { userId, productId }));
-});
-```
-
-ทั้งการหักสต็อกและ insert order อยู่ใน transaction เดียวผ่าน `manager` ตัวเดียวกัน `concurrency` ตั้งประมาณ 10-20 พอ ตั้งสูงกว่านี้ไม่ช่วยเพราะทุก job รอ lock ของ row เดียวกันอยู่ดี
-
-### 5.5 Cache Invalidation ที่ spec บังคับ
-
-| ข้อมูล | กลยุทธ์ | เหตุผล |
-|---|---|---|
-| `remainingStock` | **ไม่ invalidate** — อ่านจาก `cache:stock:*` ตรงๆ ทุก request | เปลี่ยนถี่เกินกว่า invalidation จะคุ้ม |
-| ข้อมูลสินค้าอื่น | **invalidate ทันทีหลัง DB commit** ลบ `cache:template:*` | เปลี่ยนน้อยมาก การลบทั้งหน้าจึงถูกและปลอดภัย |
-
-ลบ**หลัง**commit สำเร็จเท่านั้น ไม่ใช่ก่อน — ป้องกันหน้าต่างที่ request อื่นมา re-populate cache ด้วยข้อมูลเก่า
+- ใช้ `MGET` กับ key list ที่กำหนดไว้
+- `stockSnapshot()` ใช้ `SCAN` + `MATCH 'cache:stock:*'` เพื่อหลีกเลี่ยง `KEYS` ที่ block Redis
+- dashboard HTML อ่านข้อมูลเหล่านี้และแสดง live stock / queue health
 
 ---
 
-## 6. Failure Mode และการชดเชย
+## 9. Deployment configuration
 
-**Redis กับ Postgres จะไม่ตรงกันชั่วขณะเสมอ** — Redis counter คือ "จองแล้ว" Postgres คือ "ยืนยันแล้ว" (reservation pattern, ไม่ใช่ bug) แต่ต้องจัดการตอน job ไม่สำเร็จ:
+`deploy/docker-compose.yml` ปัจจุบันมี topology จริง:
 
-| สถานการณ์ | ทำอะไร | เหตุผล |
-|---|---|---|
-| Job fail จน attempts หมด | `INCR cache:stock` + `SREM cache:claim` ใน `onFailed` | ไม่คืน = สต็อกหายถาวร = สอบตกข้อ Data Integrity |
-| Unique violation `23505` | `UnrecoverableError` ไม่ retry, **ไม่คืนสต็อก** | user คนนี้ได้ของไปแล้วจริง |
-| Job สำเร็จ | ไม่ต้องทำอะไร | Redis หักไปตั้งแต่ enqueue แล้ว |
-
-หลังจบ load test: `cache:stock:p-1001` = `products.remaining_stock` = 0 และ `COUNT(orders)` = 50 ต้องตรงกันทั้งสามค่า
-
----
-
-## 7. `docker-compose.yml` — รายการ service (7 ตัว)
-
-| Service | Image | หมายเหตุ |
-|---|---|---|
-| `nginx` | nginx:alpine | port 80 ออกสู่ภายนอก |
-| `api1` `api2` `api3` | build (multi-stage) | `ROLE=api`, pool 5 |
-| `worker` | image เดียวกับ api | `ROLE=worker`, pool 10, mount Bull-Board |
-| `postgres` | postgres:18-alpine | healthcheck `pg_isready` |
-| `redis` | redis:7-alpine | persistence เปิด (มี queue data) |
-| `migrate` | image เดียวกับ api | one-shot: migration + seed แล้วจบ |
-
-ทุก `depends_on` ต้องใช้ `condition: service_healthy` ไม่ใช่แค่ `depends_on` เฉยๆ
-
-Dockerfile ใช้ multi-stage ตามบทที่ 01 (`builder` → `production` + `USER node`)
-
----
-
-## 8. Mapping กลับไปที่บทเรียน (สำหรับรีพอร์ต)
-
-| เทคนิคในระบบนี้ | มาจากบท |
+| Service | Role |
 |---|---|
-| Multi-stage Dockerfile, `USER node` | 01 |
-| Module/Controller/Service, DTO validation, DI | 02 |
-| `pessimistic_write` ใน transaction เดียว, unique constraint, migration | 03 |
-| Cache-aside, invalidation หลัง commit, atomic op (`DECR`/`SADD`) | 04 |
-| BullMQ, `UnrecoverableError` vs retry, Bull-Board, dead letter | 05 |
-| Nginx LB, 3 instances, stateless JWT, pool sizing, structured log | 06 |
+| `nginx` | reverse proxy |
+| `api1` to `api6` | NestJS API instances |
+| `worker` | BullMQ processor |
+| `postgres` | DB |
+| `redis` | cache + queue + counters |
+| `migrate` | migration + seed |
 
-**จุดที่ต่างจากบทเรียน และเหตุผล (ควรเขียนในรีพอร์ต เพราะแสดงว่าเข้าใจ ไม่ใช่ทำตามสูตร):**
-- ไม่ทำ read replica — read ไม่แตะ DB เลย replica จะไม่มีงานทำ
-- ไม่แยก Redis เป็น 2 container — ที่ scale 500 users contention ไม่ถึงจุดที่ต้องแยก, ประหยัด resource ไปเผื่อ Postgres แทน
-- ไม่ใช้ `SETNX` lock แต่ใช้ `SADD` — ไม่มีปัญหา TTL หมดอายุกลางคัน
-- ไม่ใช้ pub/sub สำหรับงานตัดสต็อก — บทที่ 05 เตือนไว้ว่า multi-instance จะทำงานซ้ำ
+ค่าความจำกัดจริงจาก compose:
 
----
+- api limit: `cpus: "0.55"`, `memory: 424M`
+- nginx limit: `cpus: "0.85"`, `memory: 128M`
+- worker limit: `cpus: "0.35"`, `memory: 384M`
+- postgres limit: `cpus: "0.25"`, `memory: 512M`
+- redis limit: `cpus: "0.35"`, `memory: 512M`
 
-## 9. Load Test และสิ่งที่ต้องพิสูจน์
+Postgres config ปัจจุบัน:
 
-**Preparation:** ขอ token 500 ใบ (`user-1`…`user-500`) ใน `setup()` ของ k6
-
-**Read scenario:** 1,000 VU ยิง `GET /products?page=1&limit=10` + สลับ `page`/`limit` บ้าง
-
-**Write scenario:** 500 VU ยิง `POST /orders` ชิง `p-1001` โดยให้บาง VU ยิง 2-3 ครั้งซ้อน
-
-**ตัวเลขที่ต้องเก็บ:** cache hit/miss ratio (L1/L2), queue completed/failed/waiting, req/s, p95, error rate
-
-**หลักฐานความถูกต้อง:**
-```sql
-SELECT remaining_stock FROM products WHERE product_id = 'p-1001';  -- ต้องได้ 0 พอดี
-SELECT COUNT(*) total, COUNT(DISTINCT user_id) uniq
-FROM orders WHERE product_id = 'p-1001';                            -- ต้องได้ 50 / 50
+```yaml
+command: >
+  postgres
+  -c shared_buffers=192MB
+  -c max_connections=120
+  -c work_mem=4MB
+  -c synchronous_commit=off
 ```
 
-**ข้อควรระวัง:** ต้อง reset ระบบ (truncate orders + reset stock ทั้ง DB และ Redis) ก่อนยิงทุกครั้ง
+และ `AppModule` ตั้ง pool สำหรับแต่ละ role:
 
-**Instance count sweep (แนะนำใส่ในรีพอร์ต):** ทดลอง 3 vs 4 instances แล้วดูว่า req/s ต่างกันจริงไหมบนเครื่อง 4 vCPU นี้ — ถ้าไม่ต่างกันมาก แสดงว่าชนเพดาน CPU ของเครื่องแล้ว ไม่ใช่เพดานของ instance count เป็นหลักฐานเชิงประจักษ์ที่ดีกว่าการเดา
-
----
-
-## 10. ข้อเสนอการแบ่งงาน 3 คน
-
-| คน | ขอบเขต | ส่งมอบ |
-|---|---|---|
-| A — Infrastructure | docker-compose, Nginx, Dockerfile, Postgres, migration + seed, health check, pool sizing | ระบบ 1-click start ที่ขึ้นครบทุก service |
-| B — Read path | products module, Redis template cache (no in-process cache), pagination + input validation, metrics endpoint | `GET /products` ที่ไม่แตะ DB ใน steady state |
-| C — Write path | auth + JWT guard, orders controller, Lua script, BullMQ, worker, compensation, Bull-Board | `POST /orders` ที่ผ่าน integrity test |
-
-งานร่วม: k6 script, การรันทดสอบ, รีพอร์ต — A ควรเสร็จก่อนใน 2 วันแรกเพราะอีกสองคนถูกบล็อกอยู่
+- API: `POSTGRES_POOL_API` default 5
+- Worker: `POSTGRES_POOL_WORKER` default 10
 
 ---
 
-## 11. Checklist ก่อนส่ง
+## 10. Current design differences from an older “idealized” design
 
-- [ ] `docker compose up` ครั้งเดียวขึ้นครบ ไม่ต้องรันคำสั่งเสริม
-- [ ] ยิง `page`/`limit` มั่วๆ แล้วไม่มี 500 หลุดออกมา
-- [ ] field ใน response ตรง spec ทุกตัว
-- [ ] `remaining_stock` = 0 พอดี, orders = 50 unique users
-- [ ] ยิงทดสอบซ้ำได้หลังรีเซ็ต โดยได้ผลเหมือนเดิม
-- [ ] Bull-Board เข้าถึงได้และมีตัวเลขให้แคป
-- [ ] ตั้ง `mem_limit` + `NODE_OPTIONS` ครบทุก service ก่อนยิงจริง (กัน OOM-kill กลาง demo)
-- [ ] k6 script ยิง API ของกลุ่มอื่นได้โดยเปลี่ยนแค่ base URL
-- [ ] unit test มี mock ที่ไม่แตะ DB/Redis จริง อย่างน้อย 1 ชุดต่อ module (คะแนนส่วน NestJS)
+ความแตกต่างที่สำคัญระหว่าง system กับฉบับ conceptual แบบเก่าคือ:
+
+1. Product template cache ใช้ key ที่ชื่อ `cache:products:tpl:*` ไม่ใช่ `cache:template:{page}:{limit}`
+2. Redis mutex ใช้ `lock:{pageKey}` พร้อม polling logic ไม่ใช่ broad delete
+3. invalidation ใช้ tracked set + `UNLINK` ไม่ใช่ `DEL cache:template:*` แบบดิบ
+4. queue job ID ใช้ `userId|productId` แทน `${userId}:${productId}` เพื่อหลีกเลี่ยง colon ที่ BullMQ reserve ไว้
+5. API instance จริงมี 6 ตัว ไม่ใช่ 3 ตัว
+6. worker concurrency default เป็น `30`, ไม่ใช่ “10-20” แบบแนวคิด
+7. dashboard และ metrics จะอ่านจาก Redis live state ไม่ใช่ in-memory flush ทุก 1s แบบผู้เขียนอ้างในสิ่งที่เก่า ๆ
+
+สิ่งเหล่านี้ไม่ใช่ bug แต่มาจากการปรับ architecture ให้สอดคล้องกับ repo จริงที่รันอยู่
+
+---
+
+## 11. Verification checklist
+
+รายการที่ควรยืนยันก่อนส่งหรือ present ให้ทีม:
+
+- [ ] `docker compose up` เรียก service ทั้งหมดพร้อมใช้งาน
+- [ ] API health check / worker health check / postgres / redis ปกติ
+- [ ] `GET /products?page=1&limit=10` คืน JSON ที่มี field ครบและ `remainingStock` ถูกต้องตาม Redis
+- [ ] `POST /orders` สำหรับ user เดียวกันและ product เดียวกันถูก reject ถูกต้อง
+- [ ] จำนวน orders ที่ยืนยันใน Postgres เท่ากับ stock ที่จองจริงใน Redis
+- [ ] Bull-Board เปิดได้ผ่าน nginx route
+- [ ] worker compensation ทำงานเมื่อ retry หมดก่อนเกิน timeout
+- [ ] unit tests ปกติสำหรับ `OrdersService` และ `ProductsService`
+
+---
+
+## 12. สรุป
+
+ระบบนี้ใช้ architecture ที่ balance ระหว่าง correctness และ throughput:
+
+- Redis เป็น source ของ live stock และ template cache
+- queue worker แยกออกจาก API process
+- Postgres เป็น source of truth และทำ transaction lock แบบ pessimistic
+- `GET /products` ไม่มีการทำ DB read ใน steady state เมื่อ template cache hit
+- `POST /orders` ใช้ reservation pattern เพื่อให้ reject fast และ prevent duplicate claims
+
+จุดสำคัญคือ architecture นี้เป็น “current implementation” ของ repo มากกว่าความคิดเชิง Idealized ว่าจะต้องเป็นแบบไหน ดังนั้นเอกสารนี้สะท้อน actual behavior และ actual keys ที่ code ใช้อย่างตรงไปตรงมา

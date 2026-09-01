@@ -64,6 +64,7 @@ export const DASHBOARD_HTML = `<!doctype html>
 
   <div class="card">
     <h2>Queue (BullMQ)</h2>
+    <div class="row"><span class="k">worker status</span><span id="q_worker">–</span></div>
     <div class="row"><span class="k">waiting</span><span id="q_wait">0</span></div>
     <div class="row"><span class="k">active</span><span id="q_act">0</span></div>
     <div class="row"><span class="k">delayed</span><span id="q_del">0</span></div>
@@ -103,6 +104,11 @@ export const DASHBOARD_HTML = `<!doctype html>
 
       var acc = m.orders_accepted || 0, sold = m.orders_soldout || 0, dup = m.orders_duplicate || 0;
       n('o_acc', acc); n('o_sold', sold); n('o_dup', dup); n('o_tot', acc + sold + dup);
+
+      var worker = d.workerStatus || 'down';
+      var elWorker = document.getElementById('q_worker');
+      elWorker.textContent = worker.toUpperCase();
+      elWorker.className = worker === 'up' ? 'pill ok' : 'pill bad';
 
       n('q_wait', q.waiting || 0); n('q_act', q.active || 0); n('q_del', q.delayed || 0);
       n('q_comp', q.completed || 0); n('q_fail', q.failed || 0);
